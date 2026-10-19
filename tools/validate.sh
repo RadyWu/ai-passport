@@ -35,6 +35,14 @@ run_static_checks() {
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
         tests/test_key_guard.c -o "${test_dir}/test_key_guard"
     "${test_dir}/test_key_guard"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_app_article.c main/app_article.c \
+        -o "${test_dir}/test_app_article"
+    "${test_dir}/test_app_article"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_app_cooldown.c \
+        -o "${test_dir}/test_app_cooldown"
+    "${test_dir}/test_app_cooldown"
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Icomponents/bsp/src \
         tests/test_bsp_display_rounding.c components/bsp/src/bsp_display_rounding.c \
         -o "${test_dir}/test_bsp_display_rounding"
@@ -65,6 +73,7 @@ run_static_checks() {
         "${test_dir}/test_demo_${demo}_runtime"
     done
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_deep_sleep_contract.py
+    PYTHONDONTWRITEBYTECODE=1 python3 tests/test_toilet_font_coverage.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_key_wake_contract.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_check_repo.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_verify_firmware.py

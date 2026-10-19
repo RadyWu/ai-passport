@@ -106,6 +106,12 @@ The engineering rules themselves live under
 
 - [Xiaonuo Jianlu (Voice Notes & Lists)](noah-1106/xiaonuo-jianlu/README.md) — hold-to-talk AI notes organized by a self-hosted hub, a stacked-card list UI, offline capture with on-device playback, BLUFI + mDNS zero-config setup, and a work-domain watchdog.
 
+### Yuxuan-Wu
+
+**Application playbooks:**
+
+- [Bathroom Short-Read](yuxuan-wu/bathroom-short-read/README.md) — a SoftAP + LAN-configured Chinese short-article reader (解闷阅读) with DeepSeek fetch, cooldown, deep sleep, and Wi-Fi recovery while SoftAP is up.
+
 ## Adding an experience entry
 
 Each release may produce **one or more** reusable, post-release learnings; each is

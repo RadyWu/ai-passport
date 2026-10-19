@@ -56,3 +56,12 @@
 - Updated software-design and project README references for the new documentation structure.
 - Added the documentation catalog and task-triggered routing based on the earlier repository model.
 - Added bilingual contribution, code-of-conduct, security, and support documents tailored to this ESP-IDF and fork workflow.
+
+## v1.0.0-bathroom-short-read — 2026-10-19
+
+Fork release of **Bathroom Short-Read** on branch `feature/bathroom-short-read`.
+
+- First public v1.0.0 of the SoftAP + LAN HTTP config reader: DeepSeek short articles, 30-minute fetch cooldown, deep sleep, and bilingual playbook under `docs/reference/yuxuan-wu/bathroom-short-read/`.
+- Stable Wi-Fi provisioning paths: first-boot SoftAP, LAN config page when online, SoftAP after link loss with debounce, STA background rescan while SoftAP is up (~8 s), and automatic SoftAP teardown after STA recovers.
+- Chinese UI fonts `font_toilet_14` / `font_toilet_20` with coverage gate `tests/test_toilet_font_coverage.py`.
+

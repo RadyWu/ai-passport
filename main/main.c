@@ -1,157 +1,481 @@
-// main/main.c —— FoloToy AI Passport BSP 驱动参考示例:初始化 + 菜单 + 按键分发。
-//
-// 按键语义(全局统一):
-//   上/下 短按   菜单中=移动选中项;演示页中=该页自定义
-//   确定  短按   菜单中=进入选中项;演示页中=该页自定义
-//   确定  长按   演示页中=返回菜单(由本文件统一拦截)
-#include "bsp_i2c.h"
-#include "bsp_display.h"
-#include "bsp_button.h"
+// AI护照 · 解闷阅读（蹲厕短文）— 独立 UI，不复用 demo 菜单外壳。
+#include "app_article.h"
+#include "app_cooldown.h"
+#include "app_deepseek.h"
+#include "app_net.h"
+#include "app_sleep.h"
+#include "app_store.h"
+#include "app_ui.h"
 #include "bsp_audio.h"
 #include "bsp_battery.h"
-#include "bsp_pins.h"      // 错误日志里要打印 BSP_LCD_* 引脚号
-#include "demo.h"
-#include "demo_navigation.h"
+#include "bsp_button.h"
+#include "bsp_display.h"
+#include "bsp_i2c.h"
+#include "bsp_pins.h"
 #include "key_guard.h"
-#include "ui_pixel.h"
-#include "lvgl.h"
+
+#include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_system.h"
+#include "esp_sntp.h"
+#include "esp_tls_errors.h"
 #include "esp_sleep.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
 
-static const char *TAG = "main";
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <netdb.h>
+#include <sys/socket.h>
 
-static const demo_entry_t DEMOS[] = {
-    { .name = "Display", .enter = demo_display_enter, .exit = demo_display_exit,
-      .key = demo_display_key },
-    { .name = "Button", .enter = demo_button_enter, .exit = demo_button_exit,
-      .key = demo_button_key },
-    { .name = "Audio", .enter = demo_audio_enter, .exit = demo_audio_exit,
-      .key = demo_audio_key, .start = demo_audio_start, .stop = demo_audio_stop },
-    { .name = "Battery", .enter = demo_battery_enter, .exit = demo_battery_exit,
-      .key = demo_battery_key },
-    { .name = "Wi-Fi", .enter = demo_wifi_enter, .exit = demo_wifi_exit,
-      .key = demo_wifi_key, .start = demo_wifi_start, .stop = demo_wifi_stop },
-    { .name = "BLE", .enter = demo_ble_enter, .exit = demo_ble_exit,
-      .key = demo_ble_key, .start = demo_ble_start, .stop = demo_ble_stop },
-    { .name = "Low Power", .enter = demo_low_power_enter, .exit = demo_low_power_exit,
-      .key = demo_low_power_key, .start = demo_low_power_start, .stop = demo_low_power_stop },
-};
-#define DEMO_COUNT (sizeof(DEMOS) / sizeof(DEMOS[0]))
+static const char *TAG = "bathroom";
+
 #define INPUT_QUEUE_DEPTH 8
+#define KEY_GUARD_MAX_US (10LL * 1000 * 1000)
 
 typedef struct {
     bsp_btn_t btn;
     bsp_btn_ev_t event;
 } input_event_t;
 
-// 各外设初始化结果:失败的项在菜单里标 [FAIL] 且不允许进入。
-static bool s_ok[DEMO_COUNT];
+typedef enum {
+    WORK_NONE = 0,
+    WORK_FETCH,
+    WORK_SLEEP,
+} work_cmd_t;
 
-static lv_obj_t *s_menu_scr;
-static lv_obj_t *s_cards[DEMO_COUNT];
-static lv_obj_t *s_rows[DEMO_COUNT];
-static lv_obj_t *s_mascot;
-static demo_navigation_t s_navigation;
 static QueueHandle_t s_input_queue;
 static TaskHandle_t s_input_task;
+static TaskHandle_t s_worker;
 static volatile bool s_input_ready;
+static key_guard_t s_key_guard;
+static app_settings_t s_settings;
+static int64_t s_session_start_us;
+static int64_t s_last_fetch_unix;
+static volatile work_cmd_t s_work_cmd;
+static volatile bool s_fetch_after_save;
+static bool s_time_ok;
+static bool s_sntp_started;
+static int s_frozen_hour;
+static int s_frozen_min;
+static bool s_have_frozen_clock;
+static app_net_state_t s_prev_net = APP_NET_IDLE;
+static bool s_was_online;
+static bool s_net_lost_modal_shown;
 
-static void menu_refresh(void) {
-    for (size_t i = 0; i < DEMO_COUNT; i++) {
-        lv_label_set_text_fmt(s_rows[i], "%s%s",
-                              DEMOS[i].name,
-                              s_ok[i] ? "" : "  [FAIL]");
-        ui_pixel_set_selected(s_cards[i], i == s_navigation.selected, s_ok[i]);
-        lv_obj_set_style_text_color(s_rows[i],
-            s_ok[i] ? lv_color_hex(UI_INK) : lv_color_hex(0x7A2020), 0);
+static const char *SAMPLE_ARTICLE =
+    "欢迎使用蹲坑阅读。单击上下按钮翻页，长按OK键生成新内容。"
+    "请连接设备热点或同一局域网，在配置页填写 DeepSeek API Key 和偏好提示词，"
+    "然后长按 OK 获取个性化短文。"
+    "双击OK按钮或十分钟无操作，进入深度睡眠，可按任意键唤醒。";
+
+static void apply_article_text(const char *text)
+{
+    /* Paginate into UI static s_art — no extra ~5KB heap during/after TLS. */
+    app_ui_set_article_text(text);
+}
+
+static void load_or_sample_article(void)
+{
+    char *buf = malloc(APP_ARTICLE_MAX_BYTES);
+    if (!buf) {
+        apply_article_text(SAMPLE_ARTICLE);
+        return;
+    }
+    buf[0] = '\0';
+    int64_t ts = 0;
+    esp_err_t err = app_store_load_article(buf, APP_ARTICLE_MAX_BYTES, &ts);
+    if (err == ESP_OK && buf[0]) {
+        s_last_fetch_unix = ts;
+        s_settings.last_fetch_unix = ts;
+        ESP_LOGI(TAG, "loaded article from NVS (%u bytes)", (unsigned)strnlen(buf, APP_ARTICLE_MAX_BYTES));
+        apply_article_text(buf);
+        /* Resume reading position after deep-sleep wake. */
+        unsigned pg = app_store_load_page();
+        app_ui_set_page(pg);
+        ESP_LOGI(TAG, "restored page %u", pg);
+    } else {
+        ESP_LOGI(TAG, "no stored article (%s), using sample", esp_err_to_name(err));
+        apply_article_text(SAMPLE_ARTICLE);
+    }
+    free(buf);
+}
+
+static void on_net(app_net_state_t st, const char *ip)
+{
+    s_prev_net = st;
+    app_ui_set_net_state(st, ip);
+
+    if (st == APP_NET_STA_FAILED) {
+        /* Abort post-save fetch; SoftAP is scheduled by app_net (APSTA keeps STA). */
+        s_fetch_after_save = false;
+        /* Modal only after retry wave fails — skips brief Wi-Fi blips. */
+        if (s_was_online && !s_net_lost_modal_shown) {
+            s_net_lost_modal_shown = true;
+            app_ui_show_net_lost();
+            ESP_LOGW(TAG, "network lost mid-use (STA_FAILED after retries)");
+        }
+    }
+
+    if (st == APP_NET_STA_CONNECTED) {
+        s_was_online = true;
+        s_net_lost_modal_shown = false;
+        ESP_LOGI(TAG, "STA up ip=%s free_heap=%u",
+                 ip ? ip : "?", (unsigned)esp_get_free_heap_size());
+        setenv("TZ", "CST-8", 1);
+        tzset();
+        if (!s_sntp_started) {
+            esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+            esp_sntp_setservername(0, "ntp.aliyun.com");
+            esp_sntp_setservername(1, "ntp.tencent.com");
+            esp_sntp_setservername(2, "pool.ntp.org");
+            esp_sntp_init();
+            s_sntp_started = true;
+            ESP_LOGI(TAG, "SNTP started (aliyun/tencent/pool)");
+        }
+        /* Config-save path: pull once as soon as STA is up (bypass long-press). */
+        if (s_fetch_after_save && s_work_cmd == WORK_NONE) {
+            s_fetch_after_save = false;
+            s_work_cmd = WORK_FETCH;
+            ESP_LOGI(TAG, "queue fetch after config save");
+        } else if (s_fetch_after_save && s_work_cmd != WORK_NONE) {
+            ESP_LOGW(TAG, "GOT_IP fetch deferred: worker busy (cmd=%d)", (int)s_work_cmd);
+        }
     }
 }
 
-static void menu_build(void) {
-    s_menu_scr = ui_pixel_screen_create("FoloToy");
+static void on_settings_saved(bool stay_connected)
+{
+    /* Runs on httpd task after NVS write + save response. */
+    app_store_load_settings(&s_settings);
 
-    for (size_t i = 0; i < DEMO_COUNT; i++) {
-        int x = 11 + (int)(i % 2) * 112;
-        int y = 52 + (int)(i / 2) * 47;
-        s_cards[i] = ui_pixel_panel_create(s_menu_scr, x, y, 102, 40, UI_PAPER);
-        s_rows[i] = lv_label_create(s_cards[i]);
-        lv_obj_set_style_text_font(s_rows[i], &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_align(s_rows[i], LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_center(s_rows[i]);
+    /* Save must not bypass the 10-minute cooldown with a failing fetch UI. */
+    time_t now = time(NULL);
+    int64_t now_sec = (now > 1700000000) ? (int64_t)now
+                      : (int64_t)(esp_timer_get_time() / 1000000LL);
+    int64_t last = s_last_fetch_unix;
+    if (last <= 0) last = s_settings.last_fetch_unix;
+    int remain = app_cooldown_remaining_minutes(last, now_sec);
+    if (now < 1700000000 && last > 1700000000) {
+        remain = 0;
+    }
+    if (remain > 0) {
+        s_fetch_after_save = false;
+        app_ui_show_cooldown(remain);
+        ESP_LOGI(TAG, "settings saved; skip fetch (cooldown %d min)", remain);
+        return;
     }
 
-    s_mascot = ui_pixel_mascot_create(s_menu_scr, 101, 242);
-
-    menu_refresh();
-    lv_screen_load(s_menu_scr);
+    app_ui_show_settings_updating();
+    s_fetch_after_save = true;
+    /* Prevent GOT_IP from starting httpd while we wait to fetch. */
+    app_net_begin_fetch_window();
+    /*
+     * Always go through do_fetch's wait/retry path via the worker.
+     * stay_connected: queue now (STA already up).
+     * Else: on_net(GOT_IP) will queue when connected — do not fetch mid-reconnect.
+     */
+    if (app_net_get_state() == APP_NET_STA_CONNECTED && s_work_cmd == WORK_NONE) {
+        s_fetch_after_save = false;
+        s_work_cmd = WORK_FETCH;
+        ESP_LOGI(TAG, "queue fetch after save (STA up, will wait for DNS/time)");
+    } else if (stay_connected && s_work_cmd != WORK_NONE) {
+        /* Worker busy: do not leave fetch_pending forever with no httpd restore. */
+        ESP_LOGW(TAG, "settings saved but worker busy — clear fetch window, keep httpd");
+        s_fetch_after_save = false;
+        app_net_restore_httpd();
+    } else {
+        ESP_LOGI(TAG, "settings saved; fetch armed for GOT_IP (stay=%d state=%d)",
+                 (int)stay_connected, (int)app_net_get_state());
+    }
 }
 
-static void enter_menu(void) {
-    menu_build();
+/** True when wall clock looks sane (SNTP done) — needed for TLS cert verify. */
+static bool wall_clock_ok(void)
+{
+    return time(NULL) > 1700000000;
 }
 
-static demo_nav_input_t navigation_input(bsp_btn_t btn, bsp_btn_ev_t event) {
-    if (event == BSP_BTN_LONG && btn == BSP_BTN_OK) return DEMO_NAV_INPUT_OK_LONG;
-    if (event != BSP_BTN_CLICK) return DEMO_NAV_INPUT_OTHER;
-    if (btn == BSP_BTN_UP) return DEMO_NAV_INPUT_UP_CLICK;
-    if (btn == BSP_BTN_DOWN) return DEMO_NAV_INPUT_DOWN_CLICK;
-    if (btn == BSP_BTN_OK) return DEMO_NAV_INPUT_OK_CLICK;
-    return DEMO_NAV_INPUT_OTHER;
+/** Best-effort DNS check for DeepSeek before burning heap on TLS. */
+static bool dns_ready_deepseek(void)
+{
+    struct addrinfo hints = { 0 };
+    struct addrinfo *res = NULL;
+    hints.ai_family = AF_INET; /* match HTTP_ADDR_TYPE_INET */
+    hints.ai_socktype = SOCK_STREAM;
+    int r = getaddrinfo("api.deepseek.com", "443", &hints, &res);
+    if (r != 0 || !res) {
+        ESP_LOGW(TAG, "DNS not ready for api.deepseek.com (gai=%d)", r);
+        return false;
+    }
+    freeaddrinfo(res);
+    return true;
 }
 
-static void process_input(const input_event_t *input) {
-    demo_nav_input_t nav_input = navigation_input(input->btn, input->event);
+static bool fetch_err_retryable(esp_err_t err)
+{
+    return err == ESP_ERR_TIMEOUT
+        || err == ESP_ERR_NO_MEM
+        || err == ESP_ERR_ESP_TLS_CONNECTION_TIMEOUT
+        || err == ESP_ERR_ESP_TLS_CANNOT_RESOLVE_HOSTNAME
+        || err == ESP_ERR_ESP_TLS_FAILED_CONNECT_TO_HOST
+        || err == ESP_ERR_ESP_TLS_SERVER_HANDSHAKE_TIMEOUT
+        || err == ESP_ERR_MBEDTLS_SSL_HANDSHAKE_FAILED
+        || err == ESP_ERR_MBEDTLS_X509_CRT_PARSE_FAILED
+        || err == ESP_FAIL;
+}
 
-    if (s_navigation.active >= 0) {
-        demo_nav_result_t result = demo_navigation_handle(&s_navigation, nav_input, true);
-        const demo_entry_t *demo = &DEMOS[result.index];
-        if (result.action == DEMO_NAV_ACTION_EXIT) {
-            esp_err_t e = demo->stop ? demo->stop() : ESP_OK;
-            if (e != ESP_OK) {
-                ESP_LOGE(TAG, "%s 页面停止失败: %s", demo->name, esp_err_to_name(e));
-                return;
+static void report_fetch_error(esp_err_t err)
+{
+    const char *msg = app_deepseek_err_msg(err);
+    if (!msg || !msg[0]) msg = "获取失败，检查网络与密钥";
+    const char *detail = app_deepseek_last_detail();
+    char body[160];
+    if (detail && detail[0]) {
+        snprintf(body, sizeof(body), "%s（%s）", msg, detail);
+    } else {
+        snprintf(body, sizeof(body), "%s", msg);
+    }
+    const char *title = "获取失败";
+    if (err == ESP_ERR_INVALID_STATE) title = "缺少 API Key";
+    else if (err == ESP_ERR_NO_MEM) title = "内存不足";
+    else if (err == ESP_ERR_ESP_TLS_CANNOT_RESOLVE_HOSTNAME) title = "网络未就绪";
+    else if (err == ESP_ERR_MBEDTLS_X509_CRT_PARSE_FAILED
+             || err == ESP_ERR_MBEDTLS_SSL_HANDSHAKE_FAILED) title = "安全连接失败";
+    else if (err == ESP_FAIL) {
+        int st = app_deepseek_last_http_status();
+        if (st == 401) title = "密钥无效";
+        else if (st == 402) title = "额度不足";
+        else if (st == 429) title = "请求过频";
+        else title = "服务返回错误";
+    }
+    app_ui_show_fetch_error(title, body);
+    ESP_LOGE(TAG, "fetch failed: %s (%s) detail=%s",
+             esp_err_to_name(err), msg, detail ? detail : "");
+}
+
+/**
+ * Wait for STA IP, SNTP, DNS, and a large enough contiguous heap block.
+ * Post-SoftAP fetch used to race httpd/SoftAP for RAM: clock OK but TLS OOM
+ * → generic 获取失败; long-press later worked once SoftAP/httpd were gone.
+ */
+static esp_err_t wait_ready_for_https(void)
+{
+    esp_err_t w = app_net_wait_sta_ip(25000);
+    if (w != ESP_OK) {
+        ESP_LOGE(TAG, "wait STA IP: %s (state=%d)", esp_err_to_name(w),
+                 (int)app_net_get_state());
+        return w;
+    }
+    /* SoftAP/httpd must be down BEFORE SNTP wait so heap can coalesce. */
+    app_net_prepare_for_tls();
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    for (int i = 0; i < 60 && !wall_clock_ok(); i++) { /* ~18s */
+        if ((i % 5) == 0) {
+            ESP_LOGI(TAG, "waiting SNTP before TLS (%d/60)", i);
+        }
+        vTaskDelay(pdMS_TO_TICKS(300));
+    }
+    if (!wall_clock_ok()) {
+        ESP_LOGW(TAG, "SNTP not ready; attempting TLS anyway");
+    } else {
+        ESP_LOGI(TAG, "wall clock OK for TLS");
+    }
+
+    for (int i = 0; i < 12 && !dns_ready_deepseek(); i++) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    /* mbedTLS + JSON need a sizable contiguous block on no-PSRAM C3. */
+    for (int i = 0; i < 30; i++) {
+        size_t free_sz = esp_get_free_heap_size();
+        size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
+        ESP_LOGI(TAG, "pre-TLS heap free=%u largest=%u (%d/30)",
+                 (unsigned)free_sz, (unsigned)largest, i);
+        if (largest >= 48000 && free_sz >= 70000) break;
+        vTaskDelay(pdMS_TO_TICKS(400));
+    }
+    return ESP_OK;
+}
+
+static void do_fetch(void)
+{
+    ESP_LOGI(TAG, "do_fetch begin heap=%u largest=%u",
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+    app_ui_show_confirm_fetch(false);
+    app_ui_set_status_msg("正在生成短文…");
+    app_store_load_settings(&s_settings);
+    if (!s_settings.has_api_key || !s_settings.api_key[0]) {
+        app_ui_show_fetch_error("缺少 API Key", "请在配置页填写 DeepSeek API Key");
+        ESP_LOGE(TAG, "fetch aborted: no api key");
+        /* on_settings_saved may have armed fetch window already — restore portal. */
+        app_net_restore_httpd();
+        return;
+    }
+
+    /* Stop httpd immediately so GOT_IP cannot restart it during SNTP wait. */
+    app_net_begin_fetch_window();
+
+    if (wait_ready_for_https() != ESP_OK) {
+        app_ui_show_fetch_error("未联网", "Wi-Fi 未连接成功，请检查账号密码后重配");
+        app_net_restore_httpd();
+        return;
+    }
+    if (app_net_get_state() != APP_NET_STA_CONNECTED) {
+        app_ui_show_fetch_error("未联网", "请先完成配网");
+        ESP_LOGE(TAG, "fetch aborted: STA not connected (state=%d)",
+                 (int)app_net_get_state());
+        app_net_restore_httpd();
+        return;
+    }
+
+    /* prepare_for_tls already ran inside wait_ready; settle once more. */
+    vTaskDelay(pdMS_TO_TICKS(500));
+    if (app_net_get_state() != APP_NET_STA_CONNECTED) {
+        app_ui_show_fetch_error("网络中断", "准备联网时断开，请重试");
+        ESP_LOGE(TAG, "fetch aborted: STA lost after prepare_for_tls");
+        app_net_restore_httpd();
+        return;
+    }
+
+    char *buf = NULL;
+    esp_err_t err = ESP_FAIL;
+    for (int attempt = 1; attempt <= 3; attempt++) {
+        free(buf);
+        buf = NULL;
+        if (attempt > 1) {
+            ESP_LOGW(TAG, "fetch attempt%d after settle (%s)",
+                     attempt, esp_err_to_name(err));
+            app_ui_set_status_msg("重试拉取短文…");
+            vTaskDelay(pdMS_TO_TICKS(1500 * attempt));
+            if (app_net_get_state() != APP_NET_STA_CONNECTED) {
+                (void)app_net_wait_sta_ip(10000);
             }
-            if (!bsp_lvgl_lock(500)) return;
-            demo->exit();
-            demo_navigation_complete_exit(&s_navigation);
-            enter_menu();
-            bsp_lvgl_unlock();
-        } else if (result.action == DEMO_NAV_ACTION_FORWARD) {
-            demo->key(input->btn, input->event);
+            app_net_prepare_for_tls();
+            vTaskDelay(pdMS_TO_TICKS(400));
+            if (!dns_ready_deepseek()) vTaskDelay(pdMS_TO_TICKS(1000));
         }
+        if (app_net_get_state() != APP_NET_STA_CONNECTED) continue;
+        err = app_deepseek_fetch(&s_settings, &buf);
+        if (err == ESP_OK && buf) break;
+        if (!fetch_err_retryable(err)) break;
+    }
+    if (err != ESP_OK || !buf) {
+        report_fetch_error(err != ESP_OK ? err : ESP_FAIL);
+        free(buf);
+        app_net_restore_httpd();
         return;
     }
-
-    if (nav_input == DEMO_NAV_INPUT_OTHER || nav_input == DEMO_NAV_INPUT_OK_LONG) return;
-    if (!bsp_lvgl_lock(500)) return;
-    demo_nav_result_t result = demo_navigation_handle(
-        &s_navigation, nav_input, s_ok[s_navigation.selected]);
-    if (result.action == DEMO_NAV_ACTION_REFRESH) {
-        menu_refresh();
-        ui_pixel_mascot_jump(s_mascot);
-    } else if (result.action == DEMO_NAV_ACTION_ENTER) {
-        const demo_entry_t *demo = &DEMOS[result.index];
-        ui_pixel_mascot_jump(s_mascot);
-        lv_obj_delete(s_menu_scr);
-        s_menu_scr = NULL;
-        s_mascot = NULL;
-        demo->enter();
-        bsp_lvgl_unlock();
-
-        esp_err_t e = demo->start ? demo->start() : ESP_OK;
-        if (e != ESP_OK) {
-            ESP_LOGE(TAG, "%s 页面启动失败: %s", demo->name, esp_err_to_name(e));
-        }
-        return;
+    time_t now = time(NULL);
+    if (now < 1700000000) {
+        /* clock not synced yet: use boot-relative pseudo to still enforce cooldown */
+        now = (time_t)(esp_timer_get_time() / 1000000LL);
     }
-    bsp_lvgl_unlock();
+    {
+        char topic[APP_STORE_TOPIC_MAX];
+        if (app_deepseek_extract_topic(buf, topic, sizeof(topic))) {
+            ESP_LOGI(TAG, "topic=%s", topic);
+            (void)app_store_push_topic(topic);
+        } else {
+            ESP_LOGW(TAG, "no ##topic## marker; article shown as-is");
+        }
+    }
+    /* Save after strip so NVS/display never keep ##题目##. */
+    esp_err_t save_err = app_store_save_article(buf, (int64_t)now);
+    if (save_err != ESP_OK) {
+        ESP_LOGE(TAG, "NVS article save failed: %s (still showing fetched text)",
+                 esp_err_to_name(save_err));
+    }
+    s_last_fetch_unix = (int64_t)now;
+    s_settings.last_fetch_unix = s_last_fetch_unix;
+
+    /* Display immediately from RAM — do not wait for reboot / NVS. */
+    apply_article_text(buf);
+    free(buf);
+    app_net_restore_httpd();
+    app_ui_set_status_msg("");
+    ESP_LOGI(TAG, "article updated");
 }
 
-static void input_task(void *arg) {
+static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user);
+
+static void worker_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        if (s_work_cmd == WORK_FETCH) {
+            s_work_cmd = WORK_NONE;
+            do_fetch();
+        } else if (s_work_cmd == WORK_SLEEP) {
+            s_work_cmd = WORK_NONE;
+            (void)app_store_save_page((uint16_t)app_ui_current_page());
+            app_ui_flash_tip("进入深度睡眠…");
+            vTaskDelay(pdMS_TO_TICKS(800));
+            if (!app_sleep_enter_deep()) {
+                /* Sleep aborted — never treat esp_restart as sleep. Re-arm keys. */
+                ESP_LOGW(TAG, "deep sleep aborted; re-init buttons");
+                (void)bsp_button_init(on_key, NULL);
+                app_ui_flash_tip("请再双击 OK 入睡");
+            }
+        } else if (s_fetch_after_save
+                   && app_net_get_state() == APP_NET_STA_CONNECTED) {
+            /* Deferred post-save fetch when GOT_IP raced a busy worker. */
+            s_fetch_after_save = false;
+            s_work_cmd = WORK_FETCH;
+            ESP_LOGI(TAG, "queue deferred fetch after config save");
+            continue;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+static void process_input(const input_event_t *input)
+{
+    /* Long-press OK: cooldown or confirm */
+    if (input->btn == BSP_BTN_OK && input->event == BSP_BTN_LONG) {
+        app_ui_note_activity();
+        time_t now = time(NULL);
+        int64_t now_sec = (now > 1700000000) ? (int64_t)now
+                          : (int64_t)(esp_timer_get_time() / 1000000LL);
+        /* Prefer stored NVS timestamp */
+        int64_t last = s_last_fetch_unix;
+        if (last <= 0) last = s_settings.last_fetch_unix;
+        int remain = app_cooldown_remaining_minutes(last, now_sec);
+        /* If wall clock invalid and last was wall-clock based, treat carefully:
+           when both are boot-relative after reboot, last from NVS may be absolute
+           unix — then remain may look huge. If now is boot-relative (< 1700000000)
+           and last looks like unix, skip cooldown block only if last is unix and now isn't. */
+        if (now < 1700000000 && last > 1700000000) {
+            /* After reboot before SNTP: allow confirm (cannot compute accurately). */
+            remain = 0;
+        }
+        if (remain > 0) {
+            app_ui_show_cooldown(remain);
+        } else {
+            app_ui_show_confirm_fetch(true);
+        }
+        return;
+    }
+
+    app_ui_on_key(input->btn, input->event);
+
+    if (app_ui_wants_fetch()) {
+        app_ui_clear_fetch_request();
+        if (s_work_cmd == WORK_NONE) s_work_cmd = WORK_FETCH;
+    }
+    if (app_ui_wants_sleep()) {
+        app_ui_clear_sleep_request();
+        if (s_work_cmd == WORK_NONE) s_work_cmd = WORK_SLEEP;
+    }
+}
+
+static void input_task(void *arg)
+{
     (void)arg;
     input_event_t input;
     for (;;) {
@@ -161,51 +485,13 @@ static void input_task(void *arg) {
     }
 }
 
-static esp_err_t input_dispatch_init(void) {
-    s_input_queue = xQueueCreate(INPUT_QUEUE_DEPTH, sizeof(input_event_t));
-    if (!s_input_queue) return ESP_ERR_NO_MEM;
-    if (xTaskCreate(input_task, "demo_input", 4096, NULL, 5, &s_input_task) != pdPASS) {
-        vQueueDelete(s_input_queue);
-        s_input_queue = NULL;
-        return ESP_ERR_NO_MEM;
-    }
-    return ESP_OK;
-}
-
-static void input_dispatch_deinit(void) {
-    s_input_ready = false;
-    if (s_input_task) {
-        vTaskDelete(s_input_task);
-        s_input_task = NULL;
-    }
-    if (s_input_queue) {
-        vQueueDelete(s_input_queue);
-        s_input_queue = NULL;
-    }
-}
-
-// Waking from deep sleep by key reboots the chip while that key is still held: the
-// button component starts a few hundred milliseconds later, registers a press that
-// is already down, and grades it a long press once it has been down for its
-// threshold (500 ms here), so an unintended action fires almost immediately. Drop
-// key actions until that press comes up; the deadline is only a safety net so a
-// stuck key cannot leave the pad dead. The state machine lives in key_guard.h so it
-// can be unit-tested without the rest of the demo.
-#define KEY_GUARD_MAX_US (10LL * 1000 * 1000)
-static key_guard_t s_key_guard;
-
-// button callbacks run on the shared esp_timer task; enqueue only and return immediately.
-static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user) {
+static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user)
+{
     (void)user;
-    // Consume the guard before the readiness check: a release can arrive after the
-    // post-init voltage sample but before input dispatch is ready, and dropping it
-    // here would leave the guard armed to swallow the next real press.
     const bool was_armed = s_key_guard.armed;
     if (key_guard_consume(&s_key_guard, ev == BSP_BTN_RELEASE, esp_timer_get_time())) {
-        // The release and the deadline both arrive on this task; log the disarm
-        // transition once it happens.
         if (was_armed && !s_key_guard.armed) {
-            ESP_LOGI(TAG, "唤醒键已松手,按键恢复响应");
+            ESP_LOGI(TAG, "wake key released");
         }
         return;
     }
@@ -214,66 +500,98 @@ static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user) {
     (void)xQueueSend(s_input_queue, &input, 0);
 }
 
-void app_main(void) {
-    ESP_LOGI(TAG, "FoloToy AI Passport BSP demo 启动");
-    const uint32_t wake_causes = esp_sleep_get_wakeup_causes();
-    if (wake_causes & ~(1u << ESP_SLEEP_WAKEUP_UNDEFINED)) {
-        ESP_LOGI(TAG, "休眠唤醒原因位图: 0x%02x", (unsigned)wake_causes);
+static void ui_timer_cb(void *arg)
+{
+    (void)arg;
+    int64_t session = (esp_timer_get_time() - s_session_start_us) / 1000000LL;
+    time_t now = time(NULL);
+    struct tm tmv;
+    bool valid = now > 1700000000 && localtime_r(&now, &tmv);
+    int hour = 0;
+    int minute = 0;
+    bool show_clock = false;
+    if (valid) {
+        hour = tmv.tm_hour;
+        minute = tmv.tm_min;
+        s_frozen_hour = hour;
+        s_frozen_min = minute;
+        s_have_frozen_clock = true;
+        s_time_ok = true;
+        show_clock = true;
+    } else if (s_have_frozen_clock) {
+        /* Keep last good wall time while offline — avoid 1970 / garbage flicker. */
+        hour = s_frozen_hour;
+        minute = s_frozen_min;
+        show_clock = true;
     }
-    // 按键唤醒时,那颗键在整个启动期间还按着。先挡住它的动作(见 on_key)。
+    app_ui_tick(session, hour, minute, show_clock);
+
+    int64_t idle = esp_timer_get_time() - app_ui_last_activity_us();
+    if (idle > (int64_t)APP_IDLE_SLEEP_SEC * 1000000LL) {
+        if (s_work_cmd == WORK_NONE) s_work_cmd = WORK_SLEEP;
+    }
+}
+
+void app_main(void)
+{
+    ESP_LOGI(TAG, "AI护照 解闷阅读 启动");
+    const uint32_t wake_causes = esp_sleep_get_wakeup_causes();
+    const esp_reset_reason_t rr = esp_reset_reason();
+    ESP_LOGI(TAG, "boot reset_reason=%d wake_causes=0x%lx",
+             (int)rr, (unsigned long)wake_causes);
     if (wake_causes & (1u << ESP_SLEEP_WAKEUP_GPIO)) {
         key_guard_arm(&s_key_guard, esp_timer_get_time(), KEY_GUARD_MAX_US);
-        ESP_LOGI(TAG, "按键唤醒:先屏蔽按键动作,直到那颗键松手");
+        ESP_LOGI(TAG, "GPIO wake: arm key guard");
+    } else if (rr == ESP_RST_SW) {
+        ESP_LOGW(TAG, "software restart (not GPIO deep-sleep wake)");
     }
+
+    ESP_ERROR_CHECK(app_store_init());
+    app_store_load_settings(&s_settings);
+    s_last_fetch_unix = s_settings.last_fetch_unix;
 
     bsp_i2c_init();
-    bsp_i2c_scan();
-
-    // 屏幕是本 demo 的 UI 载体,失败就没有菜单可言 —— 打清楚日志后退出,
-    // 不做"串口菜单"降级(那会让本文件复杂一倍,违背参考示例的初衷)。
     if (bsp_display_init() != ESP_OK || !bsp_lvgl_init()) {
-        ESP_LOGE(TAG, "显示/LVGL 初始化失败,demo 无法继续。"
-                      "检查 SPI 接线(MOSI=%d SCLK=%d CS=%d DC=%d BL=%d)",
-                 BSP_LCD_MOSI, BSP_LCD_SCLK, BSP_LCD_CS, BSP_LCD_DC, BSP_LCD_BL);
+        ESP_LOGE(TAG, "display/LVGL init failed");
         return;
     }
-    bsp_display_backlight(100);
+    app_ui_apply_brightness(app_store_load_brightness());
+    /* Skip bsp_audio_init: this app is display-only; I2S DMA steals contiguous
+     * heap that TLS needs right after SoftAP provisioning on no-PSRAM C3. */
+    (void)bsp_battery_init();
 
-    demo_navigation_init(&s_navigation, DEMO_COUNT);
+    s_input_queue = xQueueCreate(INPUT_QUEUE_DEPTH, sizeof(input_event_t));
+    xTaskCreate(input_task, "input", 4096, NULL, 5, &s_input_task);
+    xTaskCreate(worker_task, "worker", 28672, NULL, 4, &s_worker);
 
-    // 其余外设单项失败不阻塞:菜单里标 [FAIL],其他项照常可测。
-    s_ok[0] = true;                                   // Display 已确认可用
-    esp_err_t input_err = input_dispatch_init();
-    esp_err_t button_err = input_err == ESP_OK
-                         ? bsp_button_init(on_key, NULL)
-                         : ESP_ERR_INVALID_STATE;
-    s_ok[1] = input_err == ESP_OK && button_err == ESP_OK;
-    if (input_err != ESP_OK) {
-        ESP_LOGE(TAG, "按键事件任务创建失败: %s", esp_err_to_name(input_err));
-    } else if (button_err != ESP_OK) {
-        ESP_LOGE(TAG, "按键初始化失败: %s", esp_err_to_name(button_err));
-        input_dispatch_deinit();
+    esp_err_t button_err = bsp_button_init(on_key, NULL);
+    if (button_err != ESP_OK) {
+        ESP_LOGE(TAG, "button init failed: %s", esp_err_to_name(button_err));
     } else if (s_key_guard.armed) {
-        // 若唤醒键在按键驱动启动前就已松手,组件不会产生 release 事件,守卫会一直
-        // 拦到兜底。初始化完成后按真实电压同步一次:已松手立即撤防。
         const bool released = bsp_button_read_mv() >= BSP_BTN_MV_RELEASED_MIN;
         key_guard_sync_released(&s_key_guard, released);
-        if (!s_key_guard.armed) {
-            ESP_LOGI(TAG, "唤醒键在按键驱动启动前已松手,提前撤防");
-        }
     }
-    s_ok[2] = (bsp_audio_init() == ESP_OK);
-    s_ok[3] = (bsp_battery_init() == ESP_OK);
-    s_ok[4] = true;                                    // 页面内按需初始化并显示错误
-    s_ok[5] = true;
-    s_ok[6] = true;
 
+    s_session_start_us = esp_timer_get_time();
     if (bsp_lvgl_lock(1000)) {
-        enter_menu();
+        app_ui_init();
         bsp_lvgl_unlock();
         s_input_ready = true;
     }
+    load_or_sample_article();
 
-    ESP_LOGI(TAG, "就绪:Display=%d Button=%d Audio=%d Battery=%d",
-             s_ok[0], s_ok[1], s_ok[2], s_ok[3]);
+    /* SoftAP bottom-bar hint is set by app_ui_set_net_state(APP_NET_AP_MODE).
+     * Do not put a toast over the article — that caused yellow/white ghosting. */
+    app_net_set_settings_saved_cb(on_settings_saved);
+    app_net_start(on_net);
+
+    esp_timer_handle_t periodic;
+    const esp_timer_create_args_t targs = {
+        .callback = &ui_timer_cb,
+        .name = "ui_tick",
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&targs, &periodic));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(periodic, 500000)); /* 0.5s */
+
+    ESP_LOGI(TAG, "ready");
 }
