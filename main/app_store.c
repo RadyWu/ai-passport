@@ -110,6 +110,28 @@ esp_err_t app_store_save_article(const char *text, int64_t fetch_unix)
     return err;
 }
 
+bool app_store_has_article(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NS, NVS_READONLY, &h) != ESP_OK) return false;
+    /* One-byte probe: a real article returns INVALID_LENGTH with the full size. */
+    uint8_t probe = 0;
+    size_t len = sizeof(probe);
+    esp_err_t err = nvs_get_blob(h, "article", &probe, &len);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        char ch = 0;
+        len = 1;
+        err = nvs_get_str(h, "article", &ch, &len);
+        if (err == ESP_OK) {
+            nvs_close(h);
+            return ch != '\0';
+        }
+    }
+    nvs_close(h);
+    if (err == ESP_ERR_NVS_INVALID_LENGTH) return len > 1;
+    return err == ESP_OK && len > 1 && probe != 0;
+}
+
 esp_err_t app_store_load_article(char *buf, size_t buf_size, int64_t *fetch_unix)
 {
     if (!buf || buf_size == 0) return ESP_ERR_INVALID_ARG;

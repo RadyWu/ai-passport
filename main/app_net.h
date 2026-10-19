@@ -16,9 +16,10 @@ typedef void (*app_net_cb_t)(app_net_state_t state, const char *ip_or_null);
 /**
  * Called after settings are written and the save HTTP response has been
  * sent (may run on a short-lived task, not the httpd task). stay_connected
- * is true when STA was already up with the same SSID/password.
+ * is true when STA was already up with the same SSID/password. auto_fetch
+ * is true only for the first provision (no stored article yet).
  */
-typedef void (*app_net_settings_saved_cb_t)(bool stay_connected);
+typedef void (*app_net_settings_saved_cb_t)(bool stay_connected, bool auto_fetch);
 
 esp_err_t app_net_start(app_net_cb_t cb);
 void app_net_set_settings_saved_cb(app_net_settings_saved_cb_t cb);
@@ -50,3 +51,9 @@ esp_err_t app_net_wait_sta_ip(int timeout_ms);
  * app_net_start() again and restores SoftAP if still unconfigured.
  */
 void app_net_stop_for_sleep(void);
+/**
+ * True after a config save's STA join has failed (bad password or no AP)
+ * while SoftAP is still up for another try. Cleared on the next GOT_IP
+ * or the next credential apply.
+ */
+bool app_net_cred_join_gave_up(void);

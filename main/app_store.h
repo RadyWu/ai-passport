@@ -28,6 +28,8 @@ esp_err_t app_store_load_settings(app_settings_t *out);
 esp_err_t app_store_save_settings(const app_settings_t *in);
 esp_err_t app_store_save_article(const char *text, int64_t fetch_unix);
 esp_err_t app_store_load_article(char *buf, size_t buf_size, int64_t *fetch_unix);
+/** True when NVS holds a fetched article (not the built-in sample). */
+bool app_store_has_article(void);
 
 /** Recent article titles from ##题目## (newest first). Empty slots are "". */
 esp_err_t app_store_load_topics(char topics[APP_STORE_TOPIC_SLOTS][APP_STORE_TOPIC_MAX]);
