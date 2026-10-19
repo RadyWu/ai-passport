@@ -14,8 +14,12 @@ void app_ui_set_status_msg(const char *msg);
 /** Bottom tip over page+hint for ~1s (brightness / sleep). */
 void app_ui_flash_tip(const char *msg);
 void app_ui_show_confirm_fetch(bool show);
-/** Modal after SoftAP/LAN config save; fetch is started by main. */
+/** Modal after the first SoftAP/LAN config save; fetch is started by main. */
 void app_ui_show_settings_updating(void);
+/** Bad SSID/password after a config save. SoftAP stays up for another try. */
+void app_ui_show_wifi_join_failed(void);
+/** Hide that modal after the new network actually connects. */
+void app_ui_clear_wifi_join_failed(void);
 void app_ui_show_cooldown(int remain_min);
 /** Dismissible modal for fetch / save-path errors (Wi-Fi vs API vs cooldown). */
 void app_ui_show_fetch_error(const char *title, const char *body);

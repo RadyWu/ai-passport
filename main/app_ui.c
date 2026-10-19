@@ -38,6 +38,7 @@ static lv_obj_t *s_modal_body;
 static app_article_t s_art;
 static unsigned s_page;
 static bool s_confirm;
+static bool s_wifi_fail_modal;
 static bool s_want_fetch;
 static bool s_want_sleep;
 static bool s_reminded;
@@ -119,6 +120,7 @@ static void hide_modal(void)
 {
     if (s_modal) lv_obj_add_flag(s_modal, LV_OBJ_FLAG_HIDDEN);
     s_confirm = false;
+    s_wifi_fail_modal = false;
 }
 
 static void show_modal(const char *title, const char *body)
@@ -353,7 +355,31 @@ void app_ui_show_settings_updating(void)
 {
     if (!bsp_lvgl_lock(500)) return;
     s_confirm = false;
+    s_wifi_fail_modal = false;
     show_modal("设置已保存", "设置修改完成，正在更新内容");
+    bsp_lvgl_unlock();
+}
+
+void app_ui_show_wifi_join_failed(void)
+{
+    if (!bsp_lvgl_lock(500)) return;
+    s_confirm = false;
+    s_wifi_fail_modal = true;
+    show_modal("Wi-Fi 连不上",
+               "请检查名称和密码。\n热点仍开着，可马上修改。");
+    if (s_modal) lv_obj_move_foreground(s_modal);
+    show_tip_locked("Wi-Fi 连不上，请检查名称和密码", 0);
+    bsp_lvgl_unlock();
+}
+
+void app_ui_clear_wifi_join_failed(void)
+{
+    if (!s_wifi_fail_modal) return;
+    if (!bsp_lvgl_lock(500)) return;
+    if (s_wifi_fail_modal) {
+        hide_modal();
+        hide_tip_locked();
+    }
     bsp_lvgl_unlock();
 }
 

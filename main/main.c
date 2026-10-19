@@ -110,17 +110,26 @@ static void on_net(app_net_state_t st, const char *ip)
     app_ui_set_net_state(st, ip);
 
     if (st == APP_NET_STA_FAILED) {
-        /* Abort post-save fetch; SoftAP is scheduled by app_net (APSTA keeps STA). */
-        s_fetch_after_save = false;
-        /* Modal only after retry wave fails — skips brief Wi-Fi blips. */
-        if (s_was_online && !s_net_lost_modal_shown) {
-            s_net_lost_modal_shown = true;
-            app_ui_show_net_lost();
-            ESP_LOGW(TAG, "network lost mid-use (STA_FAILED after retries)");
+        if (app_net_cred_join_gave_up()) {
+            /* Dismiss 「正在更新内容」. Keep s_fetch_after_save so a late
+             * GOT_IP can still pull the first article. Reconfig never armed it.
+             * SoftAP + STA keepalive stay up for an immediate correction. */
+            app_ui_show_wifi_join_failed();
+            ESP_LOGW(TAG, "Wi-Fi join failed after config save");
+        } else {
+            /* Abort post-save fetch; SoftAP is scheduled by app_net (APSTA keeps STA). */
+            s_fetch_after_save = false;
+            /* Modal only after retry wave fails — skips brief Wi-Fi blips. */
+            if (s_was_online && !s_net_lost_modal_shown) {
+                s_net_lost_modal_shown = true;
+                app_ui_show_net_lost();
+                ESP_LOGW(TAG, "network lost mid-use (STA_FAILED after retries)");
+            }
         }
     }
 
     if (st == APP_NET_STA_CONNECTED) {
+        app_ui_clear_wifi_join_failed();
         s_was_online = true;
         s_net_lost_modal_shown = false;
         ESP_LOGI(TAG, "STA up ip=%s free_heap=%u",
@@ -147,10 +156,23 @@ static void on_net(app_net_state_t st, const char *ip)
     }
 }
 
-static void on_settings_saved(bool stay_connected)
+static void on_settings_saved(bool stay_connected, bool auto_fetch)
 {
     /* Runs on httpd task after NVS write + save response. */
     app_store_load_settings(&s_settings);
+
+    /*
+     * Later saves only reconnect. Auto-fetch would replace the article the
+     * user is still reading. Long-press OK remains the manual pull.
+     */
+    if (!auto_fetch) {
+        s_fetch_after_save = false;
+        /* Drop 「网络断开」/「正在更新内容」 so the current article stays readable. */
+        app_ui_hide_modal();
+        ESP_LOGI(TAG, "settings saved; STA only, article kept (stay=%d)",
+                 (int)stay_connected);
+        return;
+    }
 
     /* Save must not bypass the 10-minute cooldown with a failing fetch UI. */
     time_t now = time(NULL);
@@ -178,7 +200,8 @@ static void on_settings_saved(bool stay_connected)
      * stay_connected: queue now (STA already up).
      * Else: on_net(GOT_IP) will queue when connected — do not fetch mid-reconnect.
      */
-    if (app_net_get_state() == APP_NET_STA_CONNECTED && s_work_cmd == WORK_NONE) {
+    if (stay_connected && app_net_get_state() == APP_NET_STA_CONNECTED
+        && s_work_cmd == WORK_NONE) {
         s_fetch_after_save = false;
         s_work_cmd = WORK_FETCH;
         ESP_LOGI(TAG, "queue fetch after save (STA up, will wait for DNS/time)");
