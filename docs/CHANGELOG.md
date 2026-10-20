@@ -57,6 +57,14 @@
 - Added the documentation catalog and task-triggered routing based on the earlier repository model.
 - Added bilingual contribution, code-of-conduct, security, and support documents tailored to this ESP-IDF and fork workflow.
 
+## v1.0.1-bathroom-short-read - 2026-10-20
+
+Fork release of **Bathroom Short-Read** on branch `feature/bathroom-short-read`.
+
+- Saving a new Wi-Fi network on the SoftAP config page now disconnects the previous station attempt and joins the new SSID immediately. Deep sleep is not required.
+- A failed join shows a clear Wi-Fi failure screen, and SoftAP stays up so the network can be configured again.
+- An article is fetched automatically only on first provisioning, when none is stored. Later re-saves only reconnect and do not overwrite the current article.
+
 ## v1.0.0-bathroom-short-read — 2026-10-19
 
 Fork release of **Bathroom Short-Read** on branch `feature/bathroom-short-read`.

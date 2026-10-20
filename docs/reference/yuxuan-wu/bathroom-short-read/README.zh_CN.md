@@ -2,9 +2,9 @@
   <strong>简体中文</strong> · <a href="README.md">English</a>
 </p>
 
-# AI护照 · 解闷阅读（v1.0.0）
+# AI护照 · 解闷阅读（v1.0.1）
 
-蹲厕时读约 3 分钟的个性化中文短文，读完就起身。本玩法在分支 `feature/bathroom-short-read`，发布 tag 为 `v1.0.0-bathroom-short-read`。
+蹲厕时读约 3 分钟的个性化中文短文，读完就起身。本玩法在分支 `feature/bathroom-short-read`，发布 tag 为 `v1.0.1-bathroom-short-read`。
 
 ## 刷机文件
 

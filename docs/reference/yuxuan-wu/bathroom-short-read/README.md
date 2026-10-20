@@ -2,12 +2,12 @@
   <a href="README.zh_CN.md">简体中文</a> · <strong>English</strong>
 </p>
 
-# AI Passport · Bathroom Short-Read (v1.0.0)
+# AI Passport · Bathroom Short-Read (v1.0.1)
 
 Chinese-first companion notes live in [README.zh_CN.md](README.zh_CN.md).
 
 - Branch: `feature/bathroom-short-read`
-- Release tag: `v1.0.0-bathroom-short-read`
+- Release tag: `v1.0.1-bathroom-short-read`
 - Wi-Fi: SoftAP + LAN HTTP config page (SSID / password / DeepSeek API key / preference prompt)
 - Merged firmware (after validate): `build/FoloToy-AI-Passport-full.bin`
 
