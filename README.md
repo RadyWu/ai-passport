@@ -5,7 +5,7 @@
 
 基于 [FoloToy AI Passport](https://github.com/FoloToy/ai-passport) 的中文短文阅读玩法。  
 社区页面：[蹲坑阅读神器 · AI Passport](https://ai-passport.folotoy.cn/plays/1427/)  
-当前版本：**v1.0.1** · 完整固件见 [Release](https://github.com/RadyWu/ai-passport/releases/tag/v1.0.1-bathroom-short-read)
+当前版本：**v1.1.0** · 完整固件见 [Release](https://github.com/RadyWu/ai-passport/releases/tag/v1.1.0-bathroom-short-read)
 
 > 本仓库面向中文用户。玩法代码在分支 `feature/bathroom-short-read`。
 
@@ -29,19 +29,19 @@
 
 ## 使用方法
 
-* **首次准备（配网）**：刷入本玩法完整固件后开机，屏幕会提示配网。用手机连上设备热点 `AIPassport-XXXX`（XXXX 为设备后缀），浏览器打开 `http://192.168.4.1/`。在配置页填写：**2.4 GHz** Wi‑Fi 名称与密码、**DeepSeek API Key**、喜欢读什么的偏好提示词。点保存后，设备会立刻按新账号去连网。连上后屏幕显示局域网 IP。配网成功会自动拉取一篇短文。
+* **首次准备（配网）**：刷入本玩法完整固件后开机，屏幕会提示配网。用手机连上设备热点 `AIPassport-XXXX`（XXXX 为设备后缀），浏览器打开 `http://192.168.4.1/`。在配置页填写：最多 3 个 **2.4 GHz** Wi‑Fi（名称和密码，按 Wi‑Fi 1、2、3 的顺序尝试，连上一个就停止）、**DeepSeek API Key**、喜欢读什么的偏好提示词。点保存后，设备会立刻从 Wi‑Fi 1 开始去连网。连上后屏幕显示局域网 IP。配网成功会自动拉取一篇短文。
 * **开始阅读**：单击上 / 下键翻页；双击上键可直接回到第一页。
 * **获取新短文**：长按 OK，按提示确认后拉取（每 10 分钟只能获取一次）。
 * 双击 OK 键，或 10 分钟无操作，设备进入深度睡眠省电；按任意功能键唤醒，会接着显示上次读到的位置。
 * 使用 5 分钟后会提醒该起身了。
-* 同一 Wi‑Fi 下也可在浏览器打开 `http://设备IP/` 再改配置；已配过网时输入栏会预填上次的 Wi‑Fi、API Key 等信息。
+* 同一 Wi‑Fi 下也可在浏览器打开 `http://设备IP/` 再改配置；已配过网时输入栏会预填上次保存的 Wi‑Fi 名称和 API Key。
 * 请勿在截图或对外分享里露出 API Key。DeepSeek 需自行在[官网](https://platform.deepseek.com/)申请 API Key 并留意额度。
 
 ---
 
 ## 下载与刷机
 
-1. 打开 [v1.0.1 Bathroom Short Read](https://github.com/RadyWu/ai-passport/releases/tag/v1.0.1-bathroom-short-read)
+1. 打开 [v1.1.0 Bathroom Short Read](https://github.com/RadyWu/ai-passport/releases/tag/v1.1.0-bathroom-short-read)
 2. 下载完整固件 `FoloToy-AI-Passport-full.bin`
 3. 用 FoloToy 官方网页刷机工具从 `0x0` 写入（须用完整合并固件，不要只用 app 单分区镜像）
 
@@ -54,7 +54,7 @@
 | 项目 | 说明 |
 | --- | --- |
 | 玩法分支 | `feature/bathroom-short-read` |
-| 发布 Tag | `v1.0.1-bathroom-short-read` |
+| 发布 Tag | `v1.1.0-bathroom-short-read` |
 | 上游仓库 | [FoloToy/ai-passport](https://github.com/FoloToy/ai-passport) |
 
 本页面（根目录 `README.md`）放在默认分支 `main`，方便打开 GitHub 仓库首页即可看到中文说明。
