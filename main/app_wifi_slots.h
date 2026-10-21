@@ -45,22 +45,58 @@ static inline int app_wifi_first_slot(const app_wifi_cred_t slots[APP_WIFI_SLOTS
 /** No stored last-success slot. */
 #define APP_WIFI_PREF_NONE (-1)
 
+/** ASCII A–Z folded to a–z. Other bytes, including non-ASCII, stay as they are. */
+static inline char app_wifi_ascii_fold(char c)
+{
+    unsigned char u = (unsigned char)c;
+    if (u >= 'A' && u <= 'Z') return (char)(u - 'A' + 'a');
+    return (char)u;
+}
+
 /**
- * True when `ssid` equals one scan entry.
- * Match is case-sensitive and limited to the 32-character SSID field.
- * Empty names never match.
+ * SSID equality for scan matching.
+ * ASCII letters are case-insensitive. Comparison stops at the first NUL and
+ * does not treat a shorter name as a prefix of a longer one.
+ */
+static inline bool app_wifi_ssid_equal_ci(const char *a, const char *b)
+{
+    if (!a || !b) return false;
+    for (int i = 0; i < APP_WIFI_SSID_MAX; i++) {
+        unsigned char ca = (unsigned char)app_wifi_ascii_fold(a[i]);
+        unsigned char cb = (unsigned char)app_wifi_ascii_fold(b[i]);
+        if (ca != cb) return false;
+        if (ca == '\0') return true;
+    }
+    return true;
+}
+
+/**
+ * Scan entry that matches `saved`, or NULL.
+ * The returned pointer is the scan buffer (exact bytes and letter case).
+ * The first match wins. Empty names never match.
+ */
+static inline const char *app_wifi_scan_ssid(const char *saved,
+                                             const char *const *visible,
+                                             int visible_count)
+{
+    if (!saved || saved[0] == '\0' || !visible || visible_count <= 0) return NULL;
+    for (int i = 0; i < visible_count; i++) {
+        const char *got = visible[i];
+        if (!got || got[0] == '\0') continue;
+        if (app_wifi_ssid_equal_ci(saved, got)) return got;
+    }
+    return NULL;
+}
+
+/**
+ * True when `ssid` matches one scan entry, ignoring ASCII letter case.
+ * Limited to the 32-character SSID field. Empty names never match.
  */
 static inline bool app_wifi_ssid_visible(const char *ssid,
                                          const char *const *visible,
                                          int visible_count)
 {
-    if (!ssid || ssid[0] == '\0' || !visible || visible_count <= 0) return false;
-    for (int i = 0; i < visible_count; i++) {
-        const char *got = visible[i];
-        if (!got || got[0] == '\0') continue;
-        if (strncmp(ssid, got, APP_WIFI_SSID_MAX) == 0) return true;
-    }
-    return false;
+    return app_wifi_scan_ssid(ssid, visible, visible_count) != NULL;
 }
 
 /**

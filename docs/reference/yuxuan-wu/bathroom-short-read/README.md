@@ -26,7 +26,9 @@ follow in order 1 → 2 → 3. Filled slots absent from the scan are not joined,
 so an out-of-range network does not add a connect timeout. If none of the
 saved names are visible, the device takes the existing all-failed path
 (SoftAP for reconfig, STA keeps scanning) without those timeouts. With no
-stored last-success, visible slots are tried in order 1 → 2 → 3. Hidden
+stored last-success, visible slots are tried in order 1 → 2 → 3. ASCII
+letter case is ignored when matching (`MyWifi` matches `mywifi`); the join
+uses the scanned spelling, and NVS keeps the name as typed. Hidden
 SSIDs are not in the scan, so they are not joined.
 
 The first save that gets online fetches one article and shows that settings were

@@ -133,6 +133,7 @@ static void ensure_sta_softap_keepalive(void);
 static void stop_sta_softap_keepalive(void);
 static void apply_saved_sta(bool rebind_httpd);
 static bool sta_cred_is(const char *ssid, const char *pass);
+static const char *join_ssid_for(const char *saved);
 static bool join_fail_reason(uint8_t reason);
 static void install_sta_slot(const app_settings_t *s, int idx);
 static int active_slot_index(const app_wifi_cred_t slots[APP_WIFI_SLOTS]);
@@ -982,7 +983,8 @@ static void ensure_apsta_keepalive(void)
          * Skip set_config when the driver already holds that slot. */
         int idx = active_slot_index(settings.wifi);
         if (idx >= 0 && (s_slot_reload
-                         || !sta_cred_is(settings.wifi[idx].ssid, settings.wifi[idx].pass))) {
+                         || !sta_cred_is(join_ssid_for(settings.wifi[idx].ssid),
+                                         settings.wifi[idx].pass))) {
             install_sta_slot(&settings, idx);
         }
     }
@@ -1150,6 +1152,18 @@ static void ensure_softap_portal(void)
              (int)from_sta_only);
 }
 
+/** Scan spelling when this saved name was seen; otherwise the saved string. */
+static const char *join_ssid_for(const char *saved)
+{
+    if (!saved || saved[0] == '\0' || s_visible_n <= 0) return saved;
+    const char *ptrs[STA_SCAN_MAX];
+    int n = s_visible_n;
+    if (n > STA_SCAN_MAX) n = STA_SCAN_MAX;
+    for (int i = 0; i < n; i++) ptrs[i] = s_visible[i];
+    const char *hit = app_wifi_scan_ssid(saved, ptrs, n);
+    return hit ? hit : saved;
+}
+
 static bool sta_cred_is(const char *ssid, const char *pass)
 {
     wifi_config_t cur = { 0 };
@@ -1207,8 +1221,12 @@ static bool load_wifi_slots(app_wifi_cred_t slots[APP_WIFI_SLOTS])
 static void install_sta_slot(const app_settings_t *s, int idx)
 {
     if (!s || idx < 0 || idx >= APP_WIFI_SLOTS || !app_wifi_slot_filled(&s->wifi[idx])) return;
+    /* Driver must associate with the AP's spelling, not a mistyped saved name.
+     * NVS keeps whatever the user typed. */
+    const char *join_ssid = join_ssid_for(s->wifi[idx].ssid);
+    if (!join_ssid) join_ssid = s->wifi[idx].ssid;
     wifi_config_t sta = { 0 };
-    strncpy((char *)sta.sta.ssid, s->wifi[idx].ssid, sizeof(sta.sta.ssid));
+    strncpy((char *)sta.sta.ssid, join_ssid, sizeof(sta.sta.ssid));
     strncpy((char *)sta.sta.password, s->wifi[idx].pass, sizeof(sta.sta.password));
     esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &sta);
     if (err != ESP_OK) {
@@ -1217,7 +1235,7 @@ static void install_sta_slot(const app_settings_t *s, int idx)
         return;
     }
     s_active_slot = idx;
-    s_slot_reload = !sta_cred_is(s->wifi[idx].ssid, s->wifi[idx].pass);
+    s_slot_reload = !sta_cred_is(join_ssid, s->wifi[idx].pass);
     if (s_slot_reload) {
         ESP_LOGW(TAG, "STA slot %d profile did not stick", idx + 1);
     } else {
@@ -1310,7 +1328,7 @@ static int sta_collect_scan(void)
         s_visible[s_visible_n][APP_WIFI_SSID_MAX - 1] = '\0';
         bool dup = false;
         for (int j = 0; j < s_visible_n; j++) {
-            if (strncmp(s_visible[j], s_visible[s_visible_n], APP_WIFI_SSID_MAX) == 0) {
+            if (app_wifi_ssid_equal_ci(s_visible[j], s_visible[s_visible_n])) {
                 dup = true;
                 break;
             }
@@ -1791,7 +1809,7 @@ static void sta_softap_keepalive_task(void *arg)
             const int idx = active_slot_index(s.wifi);
             const bool profile_ok = idx >= 0
                 && !s_slot_reload
-                && sta_cred_is(s.wifi[idx].ssid, s.wifi[idx].pass);
+                && sta_cred_is(join_ssid_for(s.wifi[idx].ssid), s.wifi[idx].pass);
             if (ap_only || !profile_ok) {
                 if (!ap_only) {
                     ESP_LOGW(TAG, "keepalive: STA profile != slot %d — reload", idx + 1);

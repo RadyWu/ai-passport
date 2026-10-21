@@ -182,12 +182,37 @@ int main(void)
     assert(app_wifi_visible_try_order(slots, home_office, 2, 9, order) == 2);
     assert(order[0] == 0 && order[1] == 2);
 
-    /* Names are case-sensitive; a prefix is not a match. */
-    const char *almost[] = {"Home", "home-2"};
+    /* ASCII letter case is ignored. A shorter name is not a prefix match. */
+    const char *almost[] = {"home-2", "HOME_1"};
     assert(!app_wifi_ssid_visible("home", almost, 2));
+    assert(app_wifi_ssid_visible("home_1", almost, 2));
     assert(app_wifi_visible_try_order(slots, almost, 2, 0, order) == 0);
     const char *dup_home[] = {"home", "home"};
     assert(app_wifi_ssid_visible("home", dup_home, 2));
+
+    /*
+     * Hand-typed case still counts as visible. The join name is the scan
+     * entry's exact bytes, and the first scan hit wins.
+     */
+    memset(slots, 0, sizeof(slots));
+    set_slot(slots, 0, "MyWifi", "h");
+    set_slot(slots, 2, "Cafe", "c");
+    const char *folded[] = {"MYWIFI", "cafe"};
+    assert(app_wifi_ssid_visible("MyWifi", folded, 2));
+    assert(app_wifi_ssid_visible("mywifi", folded, 2));
+    assert(app_wifi_visible_try_order(slots, folded, 2, APP_WIFI_PREF_NONE, order) == 2);
+    assert(order[0] == 0 && order[1] == 2);
+    assert(app_wifi_visible_try_order(slots, folded, 2, 2, order) == 2);
+    assert(order[0] == 2 && order[1] == 0);
+    const char *scanned = app_wifi_scan_ssid("MyWifi", folded, 2);
+    assert(scanned && strcmp(scanned, "MYWIFI") == 0);
+    scanned = app_wifi_scan_ssid("Cafe", folded, 2);
+    assert(scanned && strcmp(scanned, "cafe") == 0);
+    const char *both_cases[] = {"mywifi", "MYWIFI"};
+    scanned = app_wifi_scan_ssid("MyWifi", both_cases, 2);
+    assert(scanned && strcmp(scanned, "mywifi") == 0);
+    assert(app_wifi_scan_ssid("other", folded, 2) == NULL);
+    assert(app_wifi_scan_ssid("", folded, 2) == NULL);
 
     /* Fallback walks the visible list once and stops. */
     int vis_order[] = {2, 0, 1};
