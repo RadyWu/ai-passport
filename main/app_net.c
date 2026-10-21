@@ -93,7 +93,7 @@ static volatile bool s_slot_reload;
 #define STA_EMPTY_SCAN_MAX 2
 #define STA_EMPTY_RESCAN_MS 1500
 /** Scan records kept for the SSID intersection (capped). */
-#define STA_SCAN_MAX 16
+#define STA_SCAN_MAX 32
 /** Last slot that got an IP (0..2), or -1 when NVS has no preference yet. */
 static int s_pref_slot = -1;
 /** Slot index waiting for an NVS write, or -1. */
