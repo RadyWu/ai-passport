@@ -6,6 +6,10 @@
 #include <stdio.h>
 #include <string.h>
 
+/* Slot 0 keeps the v1.0.x keys. Slots 1 and 2 are additive. */
+static const char *const WIFI_SSID_KEYS[APP_STORE_WIFI_SLOTS] = {"ssid", "ssid2", "ssid3"};
+static const char *const WIFI_PASS_KEYS[APP_STORE_WIFI_SLOTS] = {"pass", "pass2", "pass3"};
+
 static const char *TAG = "app_store";
 static const char *NS = "toilet";
 
@@ -28,6 +32,19 @@ static void copy_str(char *dst, size_t dst_sz, const char *src)
     dst[dst_sz - 1] = '\0';
 }
 
+/** Keep wifi_ssid/wifi_pass as the slot-0 mirror and has_wifi as "any slot". */
+static void normalize_wifi(app_settings_t *s)
+{
+    if (!s) return;
+    if (!app_wifi_slot_filled(&s->wifi[0]) && s->wifi_ssid[0] != '\0') {
+        copy_str(s->wifi[0].ssid, sizeof(s->wifi[0].ssid), s->wifi_ssid);
+        copy_str(s->wifi[0].pass, sizeof(s->wifi[0].pass), s->wifi_pass);
+    }
+    copy_str(s->wifi_ssid, sizeof(s->wifi_ssid), s->wifi[0].ssid);
+    copy_str(s->wifi_pass, sizeof(s->wifi_pass), s->wifi[0].pass);
+    s->has_wifi = app_wifi_first_slot(s->wifi) >= 0;
+}
+
 esp_err_t app_store_load_settings(app_settings_t *out)
 {
     if (!out) return ESP_ERR_INVALID_ARG;
@@ -39,10 +56,12 @@ esp_err_t app_store_load_settings(app_settings_t *out)
     if (err != ESP_OK) return ESP_OK;
 
     size_t len;
-    len = sizeof(out->wifi_ssid);
-    if (nvs_get_str(h, "ssid", out->wifi_ssid, &len) == ESP_OK) out->has_wifi = out->wifi_ssid[0] != '\0';
-    len = sizeof(out->wifi_pass);
-    (void)nvs_get_str(h, "pass", out->wifi_pass, &len);
+    for (int i = 0; i < APP_STORE_WIFI_SLOTS; i++) {
+        len = sizeof(out->wifi[i].ssid);
+        (void)nvs_get_str(h, WIFI_SSID_KEYS[i], out->wifi[i].ssid, &len);
+        len = sizeof(out->wifi[i].pass);
+        (void)nvs_get_str(h, WIFI_PASS_KEYS[i], out->wifi[i].pass, &len);
+    }
     len = sizeof(out->api_key);
     if (nvs_get_str(h, "apikey", out->api_key, &len) == ESP_OK) out->has_api_key = out->api_key[0] != '\0';
     len = sizeof(out->preference);
@@ -51,6 +70,7 @@ esp_err_t app_store_load_settings(app_settings_t *out)
     copy_str(out->model, sizeof(out->model), "deepseek-chat");
     (void)nvs_get_i64(h, "last_ts", &out->last_fetch_unix);
     nvs_close(h);
+    normalize_wifi(out);
     return ESP_OK;
 }
 
@@ -58,25 +78,34 @@ esp_err_t app_store_save_settings(const app_settings_t *in)
 {
     if (!in) return ESP_ERR_INVALID_ARG;
     nvs_handle_t h;
+    app_settings_t stored = *in;
+    normalize_wifi(&stored);
+
     esp_err_t err = nvs_open(NS, NVS_READWRITE, &h);
     if (err != ESP_OK) return err;
-    err = nvs_set_str(h, "ssid", in->wifi_ssid);
-    if (err == ESP_OK) err = nvs_set_str(h, "pass", in->wifi_pass);
-    if (err == ESP_OK) err = nvs_set_str(h, "apikey", in->api_key);
-    if (err == ESP_OK) err = nvs_set_str(h, "pref", in->preference);
+    for (int i = 0; i < APP_STORE_WIFI_SLOTS && err == ESP_OK; i++) {
+        err = nvs_set_str(h, WIFI_SSID_KEYS[i], stored.wifi[i].ssid);
+        if (err == ESP_OK) err = nvs_set_str(h, WIFI_PASS_KEYS[i], stored.wifi[i].pass);
+    }
+    if (err == ESP_OK) err = nvs_set_str(h, "apikey", stored.api_key);
+    if (err == ESP_OK) err = nvs_set_str(h, "pref", stored.preference);
     if (err == ESP_OK) err = nvs_set_str(h, "model", "deepseek-chat");
     if (err == ESP_OK) err = nvs_commit(h);
     nvs_close(h);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "settings save failed: %s (ssid_len=%u key_len=%u)",
+        ESP_LOGE(TAG, "settings save failed: %s (ssid_len=%u/%u/%u key_len=%u)",
                  esp_err_to_name(err),
-                 (unsigned)strnlen(in->wifi_ssid, sizeof(in->wifi_ssid)),
-                 (unsigned)strnlen(in->api_key, sizeof(in->api_key)));
+                 (unsigned)strnlen(stored.wifi[0].ssid, sizeof(stored.wifi[0].ssid)),
+                 (unsigned)strnlen(stored.wifi[1].ssid, sizeof(stored.wifi[1].ssid)),
+                 (unsigned)strnlen(stored.wifi[2].ssid, sizeof(stored.wifi[2].ssid)),
+                 (unsigned)strnlen(stored.api_key, sizeof(stored.api_key)));
     } else {
-        ESP_LOGI(TAG, "settings saved ssid_len=%u key_len=%u pref_len=%u (api key not logged)",
-                 (unsigned)strnlen(in->wifi_ssid, sizeof(in->wifi_ssid)),
-                 (unsigned)strnlen(in->api_key, sizeof(in->api_key)),
-                 (unsigned)strnlen(in->preference, sizeof(in->preference)));
+        ESP_LOGI(TAG, "settings saved ssid_len=%u/%u/%u key_len=%u pref_len=%u (secrets not logged)",
+                 (unsigned)strnlen(stored.wifi[0].ssid, sizeof(stored.wifi[0].ssid)),
+                 (unsigned)strnlen(stored.wifi[1].ssid, sizeof(stored.wifi[1].ssid)),
+                 (unsigned)strnlen(stored.wifi[2].ssid, sizeof(stored.wifi[2].ssid)),
+                 (unsigned)strnlen(stored.api_key, sizeof(stored.api_key)),
+                 (unsigned)strnlen(stored.preference, sizeof(stored.preference)));
     }
     return err;
 }

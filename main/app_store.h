@@ -1,4 +1,5 @@
 #pragma once
+#include "app_wifi_slots.h"
 #include "esp_err.h"
 #include <stdbool.h>
 #include <stdint.h>
@@ -7,18 +8,27 @@
 #define APP_STORE_API_KEY_MAX 128
 #define APP_STORE_PROMPT_MAX 512
 #define APP_STORE_MODEL_MAX 64
-#define APP_STORE_SSID_MAX 33
-#define APP_STORE_PASS_MAX 65
+#define APP_STORE_SSID_MAX APP_WIFI_SSID_MAX
+#define APP_STORE_PASS_MAX APP_WIFI_PASS_MAX
 #define APP_STORE_TOPIC_MAX 64
 #define APP_STORE_TOPIC_SLOTS 5
+#define APP_STORE_WIFI_SLOTS APP_WIFI_SLOTS
 
 typedef struct {
+    /** Slot 0 mirror. Prefer `wifi[]` for new code. NVS key remains "ssid"/"pass". */
     char wifi_ssid[APP_STORE_SSID_MAX];
     char wifi_pass[APP_STORE_PASS_MAX];
+    /**
+     * Up to 3 networks, tried in order. Empty SSID slots are skipped.
+     * Slot 0 uses the original NVS keys "ssid"/"pass" so v1.0.x devices keep Wi-Fi 1.
+     * Slots 1 and 2 use "ssid2"/"pass2" and "ssid3"/"pass3".
+     */
+    app_wifi_cred_t wifi[APP_STORE_WIFI_SLOTS];
     char api_key[APP_STORE_API_KEY_MAX];
     char preference[APP_STORE_PROMPT_MAX];
     char model[APP_STORE_MODEL_MAX];
     int64_t last_fetch_unix;
+    /** True when any slot has a non-empty SSID. */
     bool has_wifi;
     bool has_api_key;
 } app_settings_t;

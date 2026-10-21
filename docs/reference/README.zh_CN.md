@@ -103,7 +103,7 @@
 
 **应用档案：**
 
-- [解闷阅读（Bathroom Short-Read）](yuxuan-wu/bathroom-short-read/README.zh_CN.md) — SoftAP + 局域网配网的中文短文阅读器：DeepSeek 拉文、冷却、深睡，以及热点开启时的原 Wi‑Fi 后台回连。
+- [解闷阅读（Bathroom Short-Read）](yuxuan-wu/bathroom-short-read/README.zh_CN.md) — SoftAP + 局域网配网的中文短文阅读器：DeepSeek 拉文、冷却、深睡、最多三组按顺序尝试的 Wi‑Fi，以及热点开启时的后台回连。
 
 ## 新增经验条目
 

@@ -110,7 +110,7 @@ The engineering rules themselves live under
 
 **Application playbooks:**
 
-- [Bathroom Short-Read](yuxuan-wu/bathroom-short-read/README.md) — a SoftAP + LAN-configured Chinese short-article reader with DeepSeek fetch, cooldown, deep sleep, and Wi-Fi recovery while SoftAP is up.
+- [Bathroom Short-Read](yuxuan-wu/bathroom-short-read/README.md) — a SoftAP + LAN-configured Chinese short-article reader with DeepSeek fetch, cooldown, deep sleep, up to three ordered Wi-Fi networks, and recovery while SoftAP is up.
 
 ## Adding an experience entry
 

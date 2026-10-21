@@ -70,8 +70,20 @@ static volatile bool s_sta_apply_busy;
 /** Count real join failures after a credential apply; then show Wi-Fi error. */
 static volatile bool s_cred_watch;
 static volatile bool s_cred_gave_up;
-static volatile int s_cred_fail_streak;
-/** Wrong password / missing AP while SoftAP is up. Keep searching after this. */
+/**
+ * Which saved slot the driver should be using (0..2), or -1 before the first
+ * install. Failures on this slot advance 1 → 2 → 3; empty SSIDs are skipped.
+ */
+static int s_active_slot = -1;
+/** Join failures already counted on s_active_slot (not including the next one). */
+static int s_slot_fails;
+/** Driver STA profile is not s_active_slot yet; next connect must set_config. */
+static volatile bool s_slot_reload;
+/**
+ * Join failures on the current slot before trying the next saved network.
+ * One filled slot still waits for this many failures before the existing
+ * all-failed screen (same budget as the single-SSID firmware).
+ */
 #define CRED_JOIN_FAIL_MAX 3
 /** Serialize stop/start httpd (boot, outage, GOT_IP, phone-join watch). */
 static SemaphoreHandle_t s_httpd_mu;
@@ -92,9 +104,14 @@ static void ensure_softap_ip_dhcp(void);
 static void schedule_httpd_if_needed(const char *why);
 static void ensure_sta_softap_keepalive(void);
 static void stop_sta_softap_keepalive(void);
-static void apply_saved_sta(const char *ssid, const char *pass, bool rebind_httpd);
-static bool sta_ssid_is(const char *ssid);
+static void apply_saved_sta(bool rebind_httpd);
+static bool sta_cred_is(const char *ssid, const char *pass);
 static bool join_fail_reason(uint8_t reason);
+static void install_sta_slot(const app_settings_t *s, int idx);
+static int active_slot_index(const app_wifi_cred_t slots[APP_WIFI_SLOTS]);
+/** Load Wi-Fi slots without putting app_settings_t on a small event stack. */
+static bool load_wifi_slots(app_wifi_cred_t slots[APP_WIFI_SLOTS]);
+static bool settings_have_wifi(const app_settings_t *s);
 
 static void set_state(app_net_state_t st)
 {
@@ -231,9 +248,10 @@ static const char *PAGE_HTML_HEAD =
     "button{margin-top:18px;width:100%;padding:12px;border:0;border-radius:8px;background:#3d9cf0;color:#fff;font-size:1rem}"
     "p.hint{opacity:.7;font-size:.85rem}</style></head><body>"
     "<h1>AI护照 · 解闷阅读</h1>"
-    "<p class=hint>填写 2.4GHz Wi-Fi 与 DeepSeek API。首次请填 Wi-Fi 密码；已保存过可留空保留原密码。"
+    "<p class=hint>最多填写 3 个 2.4GHz Wi-Fi，按 Wi-Fi 1、2、3 的顺序尝试，连上一个就停止；空着的名称会跳过。"
+    "首次请填该 Wi-Fi 密码；已保存过可留空保留原密码。无密码网络请在密码框填一个空格。"
     "首次保存并联网成功后会自动拉取一篇短文。之后再保存只连接 Wi-Fi，不换正在读的短文；换一篇请在设备上长按 OK。"
-    "若连不上请连热点 AIPassport-xxxx，打开 192.168.4.1 重配。</p>"
+    "若都连不上，热点仍开着，请连 AIPassport-xxxx 打开 192.168.4.1 重配。</p>"
     "<form method=POST action=/save enctype=\"application/x-www-form-urlencoded\">"
     "<input type=hidden name=cfg id=cfg value=\"\">";
 
@@ -283,17 +301,47 @@ static esp_err_t root_get(httpd_req_t *req)
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     httpd_resp_sendstr_chunk(req, PAGE_HTML_HEAD);
 
-    html_escape(s.wifi_ssid, esc, HTML_ESC_BUF);
-    httpd_resp_sendstr_chunk(req, "<label>Wi-Fi 名称 (SSID)</label><input name=ssid required value=\"");
-    chunk_str(req, esc);
-    httpd_resp_sendstr_chunk(req, "\">");
+    /*
+     * Prefill SSIDs so a configured device does not show a blank name.
+     * Never prefill Wi-Fi passwords: many browsers omit password values on
+     * re-submit, which used to overwrite NVS with "" and force a bad reconnect.
+     * A blank password on save keeps that slot's saved password.
+     */
+    static const char *const slot_ssid_names[APP_WIFI_SLOTS] = {"ssid", "ssid2", "ssid3"};
+    static const char *const slot_pass_names[APP_WIFI_SLOTS] = {"pass", "pass2", "pass3"};
+    static const char *const slot_ssid_labels[APP_WIFI_SLOTS] = {
+        "Wi-Fi 1 名称 (SSID)",
+        "Wi-Fi 2 名称 (SSID)",
+        "Wi-Fi 3 名称 (SSID)",
+    };
+    static const char *const slot_pass_labels[APP_WIFI_SLOTS] = {
+        "Wi-Fi 1 密码",
+        "Wi-Fi 2 密码",
+        "Wi-Fi 3 密码",
+    };
+    for (int i = 0; i < APP_WIFI_SLOTS; i++) {
+        httpd_resp_sendstr_chunk(req, "<label>");
+        httpd_resp_sendstr_chunk(req, slot_ssid_labels[i]);
+        httpd_resp_sendstr_chunk(req, "</label><input name=");
+        httpd_resp_sendstr_chunk(req, slot_ssid_names[i]);
+        httpd_resp_sendstr_chunk(req, " maxlength=32 autocomplete=off value=\"");
+        html_escape(s.wifi[i].ssid, esc, HTML_ESC_BUF);
+        chunk_str(req, esc);
+        httpd_resp_sendstr_chunk(req, "\">");
 
-    /* Never prefill Wi-Fi password: many browsers omit password values on
-     * re-submit, which used to overwrite NVS with "" and force a bad reconnect. */
-    httpd_resp_sendstr_chunk(req,
-        "<label>Wi-Fi 密码</label>"
-        "<input name=pass type=password autocomplete=new-password "
-        "placeholder=\"首次必填；已保存可留空保留\">");
+        httpd_resp_sendstr_chunk(req, "<label>");
+        httpd_resp_sendstr_chunk(req, slot_pass_labels[i]);
+        httpd_resp_sendstr_chunk(req,
+            "</label><input type=password autocomplete=new-password name=");
+        httpd_resp_sendstr_chunk(req, slot_pass_names[i]);
+        if (s.wifi[i].pass[0] != '\0') {
+            httpd_resp_sendstr_chunk(req, " placeholder=\"已保存可留空保留\">");
+        } else if (i == 0) {
+            httpd_resp_sendstr_chunk(req, " placeholder=\"首次必填；已保存可留空保留\">");
+        } else {
+            httpd_resp_sendstr_chunk(req, " placeholder=\"可选；无密码请填一个空格\">");
+        }
+    }
 
     html_escape(s.api_key, esc, HTML_ESC_BUF);
     httpd_resp_sendstr_chunk(req, "<label>DeepSeek API Key</label><input name=apikey required autocomplete=off value=\"");
@@ -316,13 +364,18 @@ static esp_err_t root_get(httpd_req_t *req)
     return ESP_OK;
 }
 
-static bool sta_creds_match(const app_settings_t *s)
+static bool driver_sta_cred(char *ssid, size_t ssid_n, char *pass, size_t pass_n)
 {
-    if (s_state != APP_NET_STA_CONNECTED || !s) return false;
     wifi_config_t cur = { 0 };
+    if (!ssid || !pass || ssid_n == 0 || pass_n == 0) return false;
+    ssid[0] = '\0';
+    pass[0] = '\0';
+    if (s_state != APP_NET_STA_CONNECTED) return false;
     if (esp_wifi_get_config(WIFI_IF_STA, &cur) != ESP_OK) return false;
-    if (strncmp((char *)cur.sta.ssid, s->wifi_ssid, sizeof(cur.sta.ssid)) != 0) return false;
-    if (strncmp((char *)cur.sta.password, s->wifi_pass, sizeof(cur.sta.password)) != 0) return false;
+    memcpy(ssid, cur.sta.ssid, ssid_n - 1);
+    ssid[ssid_n - 1] = '\0';
+    memcpy(pass, cur.sta.password, pass_n - 1);
+    pass[pass_n - 1] = '\0';
     return true;
 }
 
@@ -431,8 +484,6 @@ static esp_err_t root_post(httpd_req_t *req)
 }
 
 typedef struct {
-    char ssid[APP_STORE_SSID_MAX];
-    char pass[APP_STORE_PASS_MAX];
     bool stay_connected;
     bool auto_fetch;
     bool apply_sta;
@@ -449,8 +500,8 @@ static void save_followup_task(void *arg)
     }
 
     if (f->apply_sta) {
-        /* Drop the in-flight STA attempt, then install the saved profile. */
-        apply_saved_sta(f->ssid, f->pass, true);
+        /* Drop the in-flight STA attempt, then install slot 1 (or the first filled). */
+        apply_saved_sta(true);
     } else if (!f->stay_connected) {
         ESP_LOGW(TAG, "settings saved but ssid empty — stay SoftAP, no STA connect");
         ensure_softap_portal();
@@ -519,17 +570,29 @@ static esp_err_t save_post(httpd_req_t *req)
 
     app_settings_t s;
     memset(&s, 0, sizeof(s));
-    bool got_ssid = form_get(body, "ssid", s.wifi_ssid, sizeof(s.wifi_ssid));
-    bool got_pass = form_get(body, "pass", s.wifi_pass, sizeof(s.wifi_pass));
+    static const char *const slot_ssid_keys[APP_WIFI_SLOTS] = {"ssid", "ssid2", "ssid3"};
+    static const char *const slot_pass_keys[APP_WIFI_SLOTS] = {"pass", "pass2", "pass3"};
+    char raw_ssid[APP_WIFI_SLOTS][APP_STORE_SSID_MAX];
+    char raw_pass[APP_WIFI_SLOTS][APP_STORE_PASS_MAX];
+    bool got_ssid_field[APP_WIFI_SLOTS];
+    bool open_pass[APP_WIFI_SLOTS];
+    memset(raw_ssid, 0, sizeof(raw_ssid));
+    memset(raw_pass, 0, sizeof(raw_pass));
+    for (int i = 0; i < APP_WIFI_SLOTS; i++) {
+        got_ssid_field[i] = form_get(body, slot_ssid_keys[i], raw_ssid[i], sizeof(raw_ssid[i]));
+        (void)form_get(body, slot_pass_keys[i], raw_pass[i], sizeof(raw_pass[i]));
+        /* Detect the open-network space before trim_field eats it. */
+        open_pass[i] = app_wifi_pass_is_open_marker(raw_pass[i]);
+        trim_field(raw_ssid[i]);
+        if (!open_pass[i]) trim_field(raw_pass[i]);
+    }
+    bool got_ssid = got_ssid_field[0];
     bool got_key = form_get(body, "apikey", s.api_key, sizeof(s.api_key));
     bool got_pref = form_get(body, "pref", s.preference, sizeof(s.preference));
     char cfg_tok[8] = {0};
     bool got_cfg = form_get(body, "cfg", cfg_tok, sizeof(cfg_tok));
-    (void)got_pass;
     (void)got_pref;
-    trim_field(s.wifi_ssid);
     trim_field(s.api_key);
-    trim_field(s.wifi_pass);
     {
         char *p = s.preference;
         while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
@@ -544,9 +607,10 @@ static esp_err_t save_post(httpd_req_t *req)
     free(body);
     body = NULL;
 
-    ESP_LOGI(TAG, "save form: got_cfg=%d got_ssid=%d got_key=%d ssid_len=%u pass_len=%u key_len=%u pref_len=%u",
+    ESP_LOGI(TAG, "save form: got_cfg=%d got_ssid=%d got_key=%d ssid_len=%u/%u/%u key_len=%u pref_len=%u",
              (int)got_cfg, (int)got_ssid, (int)got_key,
-             (unsigned)strlen(s.wifi_ssid), (unsigned)strlen(s.wifi_pass),
+             (unsigned)strlen(raw_ssid[0]), (unsigned)strlen(raw_ssid[1]),
+             (unsigned)strlen(raw_ssid[2]),
              (unsigned)strlen(s.api_key), (unsigned)strlen(s.preference));
 
     /* Captive probes / forged POSTs lack our hidden cfg=1 token. */
@@ -572,34 +636,47 @@ static esp_err_t save_post(httpd_req_t *req)
         return ESP_OK;
     }
 
-    /* Blank password / API key on re-save = keep NVS only when previous exists. */
-    const bool had_pass = prev.wifi_pass[0] != '\0';
-    const bool had_key = prev.api_key[0] != '\0';
-    if (s.wifi_pass[0] == '\0' && had_pass) {
-        strncpy(s.wifi_pass, prev.wifi_pass, sizeof(s.wifi_pass) - 1);
-        s.wifi_pass[sizeof(s.wifi_pass) - 1] = '\0';
+    /*
+     * Missing ssid2/ssid3 (older page or partial body) keeps that saved slot.
+     * A present but empty name clears it. Blank password keeps the saved one.
+     * A space-only password is an open network and does not keep the old one.
+     */
+    int need_pass_slot = -1;
+    for (int i = 0; i < APP_WIFI_SLOTS; i++) {
+        if (!got_ssid_field[i]) {
+            s.wifi[i] = prev.wifi[i];
+            continue;
+        }
+        app_wifi_merge_status_t ms = app_wifi_merge_slot(
+            &s.wifi[i], raw_ssid[i], open_pass[i] ? "" : raw_pass[i], open_pass[i],
+            &prev.wifi[i]);
+        if (ms == APP_WIFI_MERGE_NEED_PASS && need_pass_slot < 0) need_pass_slot = i;
     }
+    const bool had_key = prev.api_key[0] != '\0';
     if (s.api_key[0] == '\0' && had_key) {
         strncpy(s.api_key, prev.api_key, sizeof(s.api_key) - 1);
         s.api_key[sizeof(s.api_key) - 1] = '\0';
     }
 
-    if (s.wifi_ssid[0] == '\0') {
+    if (app_wifi_first_slot(s.wifi) < 0) {
         send_html(req,
                   "<!DOCTYPE html><html><meta charset=utf-8>"
                   "<body style=\"font-family:sans-serif;background:#1a2332;color:#e8eef7;padding:24px\">"
                   "<h2>请填写 Wi-Fi 名称</h2>"
-                  "<p>SSID 不能为空。</p>"
+                  "<p>至少填写一个 Wi-Fi 名称。空着的不会尝试。</p>"
                   "<p><a href=\"/\" style=\"color:#3d9cf0\">返回修改</a></p></body></html>");
         return ESP_OK;
     }
-    if (s.wifi_pass[0] == '\0' && !had_pass) {
-        send_html(req,
-                  "<!DOCTYPE html><html><meta charset=utf-8>"
-                  "<body style=\"font-family:sans-serif;background:#1a2332;color:#e8eef7;padding:24px\">"
-                  "<h2>请填写 Wi-Fi 密码</h2>"
-                  "<p>首次配网需要填写路由器密码。若确认是无密码网络，请在密码框填一个空格后保存。</p>"
-                  "<p><a href=\"/\" style=\"color:#3d9cf0\">返回修改</a></p></body></html>");
+    if (need_pass_slot >= 0) {
+        char page[640];
+        snprintf(page, sizeof(page),
+                 "<!DOCTYPE html><html><meta charset=utf-8>"
+                 "<body style=\"font-family:sans-serif;background:#1a2332;color:#e8eef7;padding:24px\">"
+                 "<h2>请填写 Wi-Fi %d 密码</h2>"
+                 "<p>这个名称还没有保存过密码。若确认是无密码网络，请在密码框填一个空格后保存。</p>"
+                 "<p><a href=\"/\" style=\"color:#3d9cf0\">返回修改</a></p></body></html>",
+                 need_pass_slot + 1);
+        send_html(req, page);
         return ESP_OK;
     }
     if (s.api_key[0] == '\0') {
@@ -611,12 +688,10 @@ static esp_err_t save_post(httpd_req_t *req)
                   "<p><a href=\"/\" style=\"color:#3d9cf0\">返回修改</a></p></body></html>");
         return ESP_OK;
     }
-    /* Treat a single space as open Wi-Fi (no password). */
-    if (strcmp(s.wifi_pass, " ") == 0) {
-        s.wifi_pass[0] = '\0';
-    }
     s.has_wifi = true;
     s.has_api_key = true;
+    strncpy(s.wifi_ssid, s.wifi[0].ssid, sizeof(s.wifi_ssid) - 1);
+    strncpy(s.wifi_pass, s.wifi[0].pass, sizeof(s.wifi_pass) - 1);
 
     esp_err_t serr = app_store_save_settings(&s);
     if (serr != ESP_OK) {
@@ -635,7 +710,7 @@ static esp_err_t save_post(httpd_req_t *req)
     memset(&verify, 0, sizeof(verify));
     (void)app_store_load_settings(&verify);
     if (!verify.has_api_key || strcmp(verify.api_key, s.api_key) != 0
-        || !verify.has_wifi || strcmp(verify.wifi_ssid, s.wifi_ssid) != 0) {
+        || !verify.has_wifi || !app_wifi_sets_equal(verify.wifi, s.wifi)) {
         ESP_LOGE(TAG, "NVS verify mismatch after save (wifi=%d key=%d)",
                  (int)verify.has_wifi, (int)verify.has_api_key);
         send_html(req,
@@ -646,18 +721,23 @@ static esp_err_t save_post(httpd_req_t *req)
                   "<p><a href=\"/\" style=\"color:#3d9cf0\">返回</a></p></body></html>");
         return ESP_OK;
     }
-    ESP_LOGI(TAG, "NVS verified ssid_len=%u key_len=%u",
-             (unsigned)strlen(verify.wifi_ssid), (unsigned)strlen(verify.api_key));
+    ESP_LOGI(TAG, "NVS verified ssid_len=%u/%u/%u key_len=%u",
+             (unsigned)strlen(verify.wifi[0].ssid),
+             (unsigned)strlen(verify.wifi[1].ssid),
+             (unsigned)strlen(verify.wifi[2].ssid),
+             (unsigned)strlen(verify.api_key));
 
-    const bool wifi_unchanged =
-        (strncmp(s.wifi_ssid, prev.wifi_ssid, sizeof(s.wifi_ssid)) == 0) &&
-        (strncmp(s.wifi_pass, prev.wifi_pass, sizeof(s.wifi_pass)) == 0);
+    char drv_ssid[APP_STORE_SSID_MAX];
+    char drv_pass[APP_STORE_PASS_MAX];
+    const bool have_drv = driver_sta_cred(drv_ssid, sizeof(drv_ssid), drv_pass, sizeof(drv_pass));
+    const bool wifi_unchanged = app_wifi_sets_equal(s.wifi, prev.wifi);
     const app_save_action_t action = app_save_decide((app_save_facts_t) {
         .sta_connected = (s_state == APP_NET_STA_CONNECTED),
         .wifi_unchanged = wifi_unchanged,
-        .driver_matches_new = sta_creds_match(&s),
+        .driver_matches_new = have_drv && app_wifi_driver_keeps_link(
+            s.wifi, prev.wifi, drv_ssid, drv_pass),
         .has_stored_article = app_store_has_article(),
-        .ssid_nonempty = s.wifi_ssid[0] != '\0',
+        .ssid_nonempty = app_wifi_first_slot(s.wifi) >= 0,
     });
     const bool stay_connected = action.stay_connected;
 
@@ -680,17 +760,17 @@ static esp_err_t save_post(httpd_req_t *req)
         ok = "<!DOCTYPE html><html><meta charset=utf-8>"
              "<body style=\"font-family:sans-serif;background:#1a2332;color:#e8eef7;padding:24px\">"
              "<h2>已保存</h2>"
-             "<p>正在连接 Wi-Fi，连上后会自动拉取一篇短文。可关闭本页。</p>"
-             "<p style=\"opacity:.75;font-size:.9rem\">若屏幕提示连不上，请检查 Wi-Fi 账号密码，"
-             "重新连接设备热点（AIPassport-xxxx），再打开 192.168.4.1 修改。</p>"
+             "<p>正在按 Wi-Fi 1、2、3 的顺序连接，连上一个就停止。连上后会自动拉取一篇短文。可关闭本页。</p>"
+             "<p style=\"opacity:.75;font-size:.9rem\">若屏幕提示连不上，说明填写的网络都没连上。"
+             "请检查名称和密码，重新连接设备热点（AIPassport-xxxx），再打开 192.168.4.1 修改。</p>"
              "</body></html>";
     } else {
         ok = "<!DOCTYPE html><html><meta charset=utf-8>"
              "<body style=\"font-family:sans-serif;background:#1a2332;color:#e8eef7;padding:24px\">"
              "<h2>已保存</h2>"
-             "<p>正在连接 Wi-Fi。正在读的短文不会被替换。可关闭本页。</p>"
-             "<p style=\"opacity:.75;font-size:.9rem\">若屏幕提示连不上，请检查 Wi-Fi 账号密码，"
-             "重新连接设备热点（AIPassport-xxxx），再打开 192.168.4.1 修改。</p>"
+             "<p>正在按 Wi-Fi 1、2、3 的顺序连接，连上一个就停止。正在读的短文不会被替换。可关闭本页。</p>"
+             "<p style=\"opacity:.75;font-size:.9rem\">若屏幕提示连不上，说明填写的网络都没连上。"
+             "请检查名称和密码，重新连接设备热点（AIPassport-xxxx），再打开 192.168.4.1 修改。</p>"
              "</body></html>";
     }
     send_html(req, ok);
@@ -701,11 +781,9 @@ static esp_err_t save_post(httpd_req_t *req)
         ESP_LOGE(TAG, "followup alloc failed — connecting after short delay");
         vTaskDelay(pdMS_TO_TICKS(750));
         if (s_saved_cb) s_saved_cb(stay_connected, action.auto_fetch);
-        if (action.apply_sta) apply_saved_sta(s.wifi_ssid, s.wifi_pass, false);
+        if (action.apply_sta) apply_saved_sta(false);
         return ESP_OK;
     }
-    strncpy(f->ssid, s.wifi_ssid, sizeof(f->ssid) - 1);
-    strncpy(f->pass, s.wifi_pass, sizeof(f->pass) - 1);
     f->stay_connected = stay_connected;
     f->auto_fetch = action.auto_fetch;
     f->apply_sta = action.apply_sta;
@@ -715,7 +793,7 @@ static esp_err_t save_post(httpd_req_t *req)
         vTaskDelay(pdMS_TO_TICKS(750));
         if (s_saved_cb) s_saved_cb(stay_connected, action.auto_fetch);
         /* Still on the httpd task — do not httpd_stop from inside the handler. */
-        if (action.apply_sta) apply_saved_sta(s.wifi_ssid, s.wifi_pass, false);
+        if (action.apply_sta) apply_saved_sta(false);
     }
     return ESP_OK;
 }
@@ -785,7 +863,8 @@ static esp_err_t restart_httpd_unlocked(void)
      */
     config.max_open_sockets = 5;
     config.lru_purge_enable = true;
-    config.stack_size = 6144;
+    /* 3-slot form keeps several app_settings_t locals on this task. */
+    config.stack_size = 8192;
     config.recv_wait_timeout = 15;
     config.send_wait_timeout = 10;
     config.backlog_conn = 3;
@@ -841,7 +920,7 @@ static void ensure_apsta_keepalive(void)
     app_settings_t settings;
     memset(&settings, 0, sizeof(settings));
     (void)app_store_load_settings(&settings);
-    wifi_mode_t want = settings.has_wifi ? WIFI_MODE_APSTA : WIFI_MODE_AP;
+    wifi_mode_t want = settings_have_wifi(&settings) ? WIFI_MODE_APSTA : WIFI_MODE_AP;
 
     wifi_mode_t cur = WIFI_MODE_NULL;
     (void)esp_wifi_get_mode(&cur);
@@ -866,14 +945,13 @@ static void ensure_apsta_keepalive(void)
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "set AP config: %s", esp_err_to_name(err));
     }
-    if (settings.has_wifi && settings.wifi_ssid[0]) {
-        wifi_config_t sta = { 0 };
-        strncpy((char *)sta.sta.ssid, settings.wifi_ssid, sizeof(sta.sta.ssid));
-        strncpy((char *)sta.sta.password, settings.wifi_pass, sizeof(sta.sta.password));
-        /* Longer listen interval is fine; scan still happens on connect(). */
-        err = esp_wifi_set_config(WIFI_IF_STA, &sta);
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "set STA config: %s", esp_err_to_name(err));
+    if (settings_have_wifi(&settings)) {
+        /* Keep the slot already being searched; do not force Wi-Fi 1 mid-rotation.
+         * Skip set_config when the driver already holds that slot. */
+        int idx = active_slot_index(settings.wifi);
+        if (idx >= 0 && (s_slot_reload
+                         || !sta_cred_is(settings.wifi[idx].ssid, settings.wifi[idx].pass))) {
+            install_sta_slot(&settings, idx);
         }
     }
     err = esp_wifi_start();
@@ -1036,17 +1114,154 @@ static void ensure_softap_portal(void)
     }
     ESP_LOGI(TAG, "SoftAP portal ready ssid=%s http=%d dns=%d mode=%s softap=%d from_sta_only=%d",
              s_ap_ssid, s_httpd != NULL, s_dns != NULL,
-             settings.has_wifi ? "APSTA" : "AP", (int)s_softap_portal,
+             settings_have_wifi(&settings) ? "APSTA" : "AP", (int)s_softap_portal,
              (int)from_sta_only);
 }
 
-static bool sta_ssid_is(const char *ssid)
+static bool sta_cred_is(const char *ssid, const char *pass)
 {
     wifi_config_t cur = { 0 };
     if (!ssid || esp_wifi_get_config(WIFI_IF_STA, &cur) != ESP_OK) return false;
     size_t n = strnlen(ssid, sizeof(cur.sta.ssid));
     if (n == 0 || memcmp(cur.sta.ssid, ssid, n) != 0) return false;
-    return n == sizeof(cur.sta.ssid) || cur.sta.ssid[n] == '\0';
+    if (n < sizeof(cur.sta.ssid) && cur.sta.ssid[n] != '\0') return false;
+    const char *pw = pass ? pass : "";
+    size_t pn = strnlen(pw, sizeof(cur.sta.password));
+    if (memcmp(cur.sta.password, pw, pn) != 0) return false;
+    if (pn < sizeof(cur.sta.password) && cur.sta.password[pn] != '\0') return false;
+    return true;
+}
+
+static bool settings_have_wifi(const app_settings_t *s)
+{
+    return s && app_wifi_first_slot(s->wifi) >= 0;
+}
+
+static int active_slot_index(const app_wifi_cred_t slots[APP_WIFI_SLOTS])
+{
+    if (!slots) return -1;
+    if (s_active_slot >= 0 && s_active_slot < APP_WIFI_SLOTS
+        && app_wifi_slot_filled(&slots[s_active_slot])) {
+        return s_active_slot;
+    }
+    return app_wifi_first_slot(slots);
+}
+
+static app_wifi_cred_t s_wifi_cache[APP_WIFI_SLOTS];
+static bool s_wifi_cache_valid;
+
+static bool load_wifi_slots(app_wifi_cred_t slots[APP_WIFI_SLOTS])
+{
+    if (!slots) return false;
+    app_settings_t *tmp = calloc(1, sizeof(*tmp));
+    if (!tmp) {
+        if (s_wifi_cache_valid) {
+            memcpy(slots, s_wifi_cache, sizeof(s_wifi_cache));
+            return app_wifi_first_slot(slots) >= 0;
+        }
+        memset(slots, 0, sizeof(app_wifi_cred_t) * APP_WIFI_SLOTS);
+        return false;
+    }
+    (void)app_store_load_settings(tmp);
+    memcpy(slots, tmp->wifi, sizeof(tmp->wifi));
+    memcpy(s_wifi_cache, tmp->wifi, sizeof(tmp->wifi));
+    s_wifi_cache_valid = true;
+    bool have = tmp->has_wifi;
+    free(tmp);
+    return have;
+}
+
+/** Point the driver at one saved slot. Safe while STA is disconnected. */
+static void install_sta_slot(const app_settings_t *s, int idx)
+{
+    if (!s || idx < 0 || idx >= APP_WIFI_SLOTS || !app_wifi_slot_filled(&s->wifi[idx])) return;
+    wifi_config_t sta = { 0 };
+    strncpy((char *)sta.sta.ssid, s->wifi[idx].ssid, sizeof(sta.sta.ssid));
+    strncpy((char *)sta.sta.password, s->wifi[idx].pass, sizeof(sta.sta.password));
+    esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &sta);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "set STA slot %d: %s", idx + 1, esp_err_to_name(err));
+        s_slot_reload = true;
+        return;
+    }
+    s_active_slot = idx;
+    s_slot_reload = !sta_cred_is(s->wifi[idx].ssid, s->wifi[idx].pass);
+    if (s_slot_reload) {
+        ESP_LOGW(TAG, "STA slot %d profile did not stick", idx + 1);
+    } else {
+        ESP_LOGI(TAG, "STA profile slot %d ssid_len=%u",
+                 idx + 1, (unsigned)strlen(s->wifi[idx].ssid));
+    }
+}
+
+/**
+ * Count a join failure against the active slot. On budget exhaustion, move to
+ * the next filled slot (1 → 2 → 3, skipping empties). EXHAUSTED means every
+ * filled slot has been tried; a credential apply then uses the existing
+ * failure screen, and search wraps to the first filled slot.
+ * Does not call Wi-Fi APIs — safe on the event task.
+ */
+static void note_slot_join_fail(const app_wifi_cred_t slots[APP_WIFI_SLOTS], uint8_t reason)
+{
+    if (!slots || !join_fail_reason(reason)) return;
+    int idx = active_slot_index(slots);
+    if (idx < 0) return;
+    s_active_slot = idx;
+    int next = idx;
+    app_wifi_fail_action_t act = app_wifi_on_fail(
+        slots, idx, s_slot_fails + 1, CRED_JOIN_FAIL_MAX, &next);
+    if (act == APP_WIFI_FAIL_KEEP) {
+        s_slot_fails++;
+        ESP_LOGI(TAG, "STA join fail slot %d %d/%d reason=%u",
+                 idx + 1, s_slot_fails, CRED_JOIN_FAIL_MAX, reason);
+        return;
+    }
+    s_slot_fails = 0;
+    s_active_slot = next;
+    s_slot_reload = true;
+    ESP_LOGI(TAG, "STA join slot %d exhausted -> slot %d (%s) reason=%u",
+             idx + 1, (next >= 0 ? next + 1 : 0),
+             act == APP_WIFI_FAIL_EXHAUSTED ? "all tried" : "next", reason);
+    if (act == APP_WIFI_FAIL_EXHAUSTED && s_cred_watch) {
+        s_cred_watch = false;
+        s_cred_gave_up = true;
+    }
+}
+
+/** set_config off the Wi-Fi event task, then connect the slot note_slot picked. */
+static volatile bool s_slot_task_busy;
+
+static void slot_switch_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(50));
+    if (!s_stopping_for_sleep && !s_sta_apply_busy && s_slot_reload
+        && s_state != APP_NET_STA_CONNECTED) {
+        app_settings_t s;
+        memset(&s, 0, sizeof(s));
+        (void)app_store_load_settings(&s);
+        install_sta_slot(&s, active_slot_index(s.wifi));
+        if (!s_sta_apply_busy && !s_stopping_for_sleep && s_state != APP_NET_STA_CONNECTED) {
+            esp_err_t cerr = esp_wifi_connect();
+            ESP_LOGI(TAG, "slot switch connect slot=%d err=%s",
+                     s_active_slot + 1, esp_err_to_name(cerr));
+        }
+    }
+    s_slot_task_busy = false;
+    vTaskDelete(NULL);
+}
+
+static void schedule_slot_switch(void)
+{
+    if (s_stopping_for_sleep) return;
+    if (s_slot_task_busy) return;
+    s_slot_task_busy = true;
+    if (xTaskCreate(slot_switch_task, "sta_slot", 4096, NULL, 5, NULL) != pdPASS) {
+        s_slot_task_busy = false;
+        /* Do not skip connect() — a missing call stops STA scan until wake. */
+        esp_wifi_connect();
+        ESP_LOGW(TAG, "slot switch task failed — connect kept current profile");
+    }
 }
 
 static bool join_fail_reason(uint8_t reason)
@@ -1080,9 +1295,13 @@ static bool join_fail_reason(uint8_t reason)
  * Disconnect first, while keepalive is stopped, then set_config + connect.
  * SoftAP stays up so a bad password can be fixed without another wake.
  */
-static void apply_saved_sta(const char *ssid, const char *pass, bool rebind_httpd)
+static void apply_saved_sta(bool rebind_httpd)
 {
-    if (!ssid || ssid[0] == '\0') {
+    app_settings_t settings;
+    memset(&settings, 0, sizeof(settings));
+    (void)app_store_load_settings(&settings);
+    const int first = app_wifi_first_slot(settings.wifi);
+    if (first < 0) {
         ensure_softap_portal();
         set_state(APP_NET_AP_MODE);
         return;
@@ -1092,7 +1311,9 @@ static void apply_saved_sta(const char *ssid, const char *pass, bool rebind_http
     s_sta_apply_busy = true;
     s_cred_watch = false;
     s_cred_gave_up = false;
-    s_cred_fail_streak = 0;
+    s_slot_fails = 0;
+    s_active_slot = first;
+    s_slot_reload = true;
 
     stop_sta_softap_keepalive();
     for (int i = 0; i < 40 && s_sta_ka_task != NULL; i++) {
@@ -1106,10 +1327,6 @@ static void apply_saved_sta(const char *ssid, const char *pass, bool rebind_http
     /* Drain STA_DISCONNECTED while s_sta_apply_busy blocks a reconnect. */
     vTaskDelay(pdMS_TO_TICKS(250));
 
-    wifi_config_t cfg = { 0 };
-    strncpy((char *)cfg.sta.ssid, ssid, sizeof(cfg.sta.ssid));
-    strncpy((char *)cfg.sta.password, pass ? pass : "", sizeof(cfg.sta.password));
-
     esp_err_t err = esp_wifi_set_mode(WIFI_MODE_APSTA);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "apply STA set_mode APSTA: %s", esp_err_to_name(err));
@@ -1118,18 +1335,12 @@ static void apply_saved_sta(const char *ssid, const char *pass, bool rebind_http
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "apply STA set AP: %s", esp_err_to_name(err));
     }
-    err = esp_wifi_set_config(WIFI_IF_STA, &cfg);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "apply STA set_config: %s", esp_err_to_name(err));
-    }
-    if (!sta_ssid_is(ssid)) {
+    install_sta_slot(&settings, first);
+    if (s_slot_reload) {
         ESP_LOGW(TAG, "apply STA profile still old — disconnect and set_config again");
         (void)esp_wifi_disconnect();
         vTaskDelay(pdMS_TO_TICKS(300));
-        err = esp_wifi_set_config(WIFI_IF_STA, &cfg);
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "apply STA set_config retry: %s", esp_err_to_name(err));
-        }
+        install_sta_slot(&settings, first);
     }
 
     err = esp_wifi_start();
@@ -1160,10 +1371,12 @@ static void apply_saved_sta(const char *ssid, const char *pass, bool rebind_http
     set_state(APP_NET_STA_CONNECTING);
 
     s_cred_watch = true;
-    s_cred_fail_streak = 0;
+    s_slot_fails = 0;
+    s_active_slot = first;
     esp_err_t cerr = esp_wifi_connect();
-    ESP_LOGI(TAG, "apply STA connect ssid_len=%u err=%s softap=%d",
-             (unsigned)strlen(ssid), esp_err_to_name(cerr), (int)wifi_mode_has_ap());
+    ESP_LOGI(TAG, "apply STA connect slot=%d ssid_len=%u err=%s softap=%d",
+             first + 1, (unsigned)strlen(settings.wifi[first].ssid),
+             esp_err_to_name(cerr), (int)wifi_mode_has_ap());
 
     s_sta_apply_busy = false;
     if (s_sta_ka_task == NULL) {
@@ -1193,7 +1406,7 @@ static void sta_softap_keepalive_task(void *arg)
         app_settings_t s;
         memset(&s, 0, sizeof(s));
         (void)app_store_load_settings(&s);
-        if (!s.has_wifi || !s.wifi_ssid[0]) {
+        if (!settings_have_wifi(&s)) {
             break;
         }
 
@@ -1216,29 +1429,30 @@ static void sta_softap_keepalive_task(void *arg)
              * APSTA keepalive used to call connect() only. After a save that
              * did not stick, that retried the previous SSID forever.
              */
-            if (ap_only || !sta_ssid_is(s.wifi_ssid)) {
+            const int idx = active_slot_index(s.wifi);
+            const bool profile_ok = idx >= 0
+                && !s_slot_reload
+                && sta_cred_is(s.wifi[idx].ssid, s.wifi[idx].pass);
+            if (ap_only || !profile_ok) {
                 if (!ap_only) {
-                    ESP_LOGW(TAG, "keepalive: STA profile != saved SSID — reload");
+                    ESP_LOGW(TAG, "keepalive: STA profile != slot %d — reload", idx + 1);
                     (void)esp_wifi_disconnect();
                     vTaskDelay(pdMS_TO_TICKS(150));
                     if (s_sta_apply_busy || !s_sta_ka_wanted || s_stopping_for_sleep) {
                         continue;
                     }
                 } else {
-                    ESP_LOGW(TAG, "keepalive: AP-only → APSTA for home SSID scan");
+                    ESP_LOGW(TAG, "keepalive: AP-only → APSTA for saved SSID scan");
                     (void)esp_wifi_set_mode(WIFI_MODE_APSTA);
                 }
-                wifi_config_t sta = { 0 };
-                strncpy((char *)sta.sta.ssid, s.wifi_ssid, sizeof(sta.sta.ssid));
-                strncpy((char *)sta.sta.password, s.wifi_pass, sizeof(sta.sta.password));
-                (void)esp_wifi_set_config(WIFI_IF_STA, &sta);
+                install_sta_slot(&s, idx);
                 (void)esp_wifi_start();
                 vTaskDelay(pdMS_TO_TICKS(100));
             }
             if (s_sta_apply_busy) continue;
             esp_err_t cerr = esp_wifi_connect();
-            ESP_LOGI(TAG, "SoftAP keepalive STA reconnect: %s (ap=%d)",
-                     esp_err_to_name(cerr), (int)wifi_mode_has_ap());
+            ESP_LOGI(TAG, "SoftAP keepalive STA reconnect slot=%d: %s (ap=%d)",
+                     active_slot_index(s.wifi) + 1, esp_err_to_name(cerr), (int)wifi_mode_has_ap());
             /* Leave the bad-credential screen up; searching continues below. */
             if (!s_cred_gave_up && s_state != APP_NET_STA_CONNECTED) {
                 set_state(APP_NET_STA_CONNECTING);
@@ -1264,7 +1478,7 @@ static void ensure_sta_softap_keepalive(void)
     app_settings_t s;
     memset(&s, 0, sizeof(s));
     (void)app_store_load_settings(&s);
-    if (!s.has_wifi || !s.wifi_ssid[0]) return;
+    if (!settings_have_wifi(&s)) return;
 
     s_sta_ka_wanted = true;
     if (s_sta_ka_task) return;
@@ -1309,7 +1523,7 @@ static void portal_outage_task(void *arg)
         app_settings_t s;
         memset(&s, 0, sizeof(s));
         (void)app_store_load_settings(&s);
-        if (s.has_wifi && s.wifi_ssid[0] && s_state != APP_NET_STA_CONNECTED) {
+        if (settings_have_wifi(&s) && s_state != APP_NET_STA_CONNECTED) {
             s_retry = 0;
             /* SoftAP stays up for reconfig; keepalive keeps scanning home SSID.
              * Do not clear a config-save failure latch or restart its UI. */
@@ -1411,10 +1625,8 @@ static void on_wifi(void *arg, esp_event_base_t base, int32_t id, void *data)
         s_ip[0] = '\0';
         s_disc_streak++;
 
-        app_settings_t disc_settings;
-        memset(&disc_settings, 0, sizeof(disc_settings));
-        (void)app_store_load_settings(&disc_settings);
-        const bool have_wifi = disc_settings.has_wifi && disc_settings.wifi_ssid[0] != '\0';
+        app_wifi_cred_t disc_slots[APP_WIFI_SLOTS];
+        const bool have_wifi = load_wifi_slots(disc_slots);
 
         /* Unconfigured SoftAP boot: ignore stray STA disconnects — no work. */
         if (!have_wifi) {
@@ -1427,15 +1639,10 @@ static void on_wifi(void *arg, esp_event_base_t base, int32_t id, void *data)
             ESP_LOGW(TAG, "STA lost during TLS — SoftAP after restore_httpd");
         }
 
-        if (s_cred_watch && join_fail_reason(reason)) {
-            if (s_cred_fail_streak < CRED_JOIN_FAIL_MAX) s_cred_fail_streak++;
-            ESP_LOGI(TAG, "credential join fail %d/%d reason=%u",
-                     s_cred_fail_streak, CRED_JOIN_FAIL_MAX, reason);
-            if (s_cred_fail_streak >= CRED_JOIN_FAIL_MAX) {
-                s_cred_watch = false;
-                s_cred_gave_up = true;
-            }
-        }
+        /* Same per-slot budget for a fresh save and for later outage search.
+         * The failure popup latches only when a credential apply has walked
+         * every filled slot. Outage search keeps rotating without that popup. */
+        note_slot_join_fail(disc_slots, reason);
 
         /*
          * SoftAP already broadcasting: keep searching home SSID via keepalive
@@ -1468,10 +1675,14 @@ static void on_wifi(void *arg, esp_event_base_t base, int32_t id, void *data)
          */
         if (s_retry < STA_RETRY_MAX && !s_cred_gave_up) {
             s_retry++;
-            esp_wifi_connect();
+            if (s_slot_reload) {
+                schedule_slot_switch();
+            } else {
+                esp_wifi_connect();
+            }
             set_state(APP_NET_STA_CONNECTING);
-            ESP_LOGI(TAG, "STA retry %d/%d (streak=%d reason=%u)",
-                     s_retry, STA_RETRY_MAX, s_disc_streak, reason);
+            ESP_LOGI(TAG, "STA retry %d/%d slot=%d (streak=%d reason=%u)",
+                     s_retry, STA_RETRY_MAX, s_active_slot + 1, s_disc_streak, reason);
         } else {
             xEventGroupSetBits(s_wifi_eg, WIFI_FAIL_BIT);
             if (!s_tls_busy && !s_cred_gave_up) s_fetch_pending = false;
@@ -1525,7 +1736,8 @@ static void on_ip(void *arg, esp_event_base_t base, int32_t id, void *data)
         s_softap_for_outage = false;
         s_cred_watch = false;
         s_cred_gave_up = false;
-        s_cred_fail_streak = 0;
+        s_slot_fails = 0;
+        s_slot_reload = false;
         stop_sta_softap_keepalive();
         xEventGroupSetBits(s_wifi_eg, WIFI_CONNECTED_BIT);
         set_state(APP_NET_STA_CONNECTED);
@@ -1574,10 +1786,14 @@ esp_err_t app_net_start(app_net_cb_t cb)
         s_httpd_mu = xSemaphoreCreateMutex();
     }
 
-    if (settings.has_wifi) {
+    if (settings_have_wifi(&settings)) {
+        const int boot_slot = app_wifi_first_slot(settings.wifi);
+        s_active_slot = boot_slot;
+        s_slot_fails = 0;
+        s_slot_reload = false;
         wifi_config_t sta = { 0 };
-        strncpy((char *)sta.sta.ssid, settings.wifi_ssid, sizeof(sta.sta.ssid));
-        strncpy((char *)sta.sta.password, settings.wifi_pass, sizeof(sta.sta.password));
+        strncpy((char *)sta.sta.ssid, settings.wifi[boot_slot].ssid, sizeof(sta.sta.ssid));
+        strncpy((char *)sta.sta.password, settings.wifi[boot_slot].pass, sizeof(sta.sta.password));
         /*
          * Boot APSTA + SoftAP portal + httpd on THIS app task (not the wifi
          * event task). v0.14–v0.16 booted STA-only and only raised SoftAP after
@@ -1605,8 +1821,8 @@ esp_err_t app_net_start(app_net_cb_t cb)
         /* SoftAP is already up at boot — arm keepalive so a failed first
          * connect cannot stall STA forever (event-task throttle bug). */
         ensure_sta_softap_keepalive();
-        ESP_LOGI(TAG, "boot APSTA ssid_len=%u softap=%s http=%d dns=%d",
-                 (unsigned)strlen(settings.wifi_ssid), s_ap_ssid,
+        ESP_LOGI(TAG, "boot APSTA slot=%d ssid_len=%u softap=%s http=%d dns=%d",
+                 boot_slot + 1, (unsigned)strlen(settings.wifi[boot_slot].ssid), s_ap_ssid,
                  s_httpd != NULL, s_dns != NULL);
     } else {
         ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
@@ -1707,7 +1923,7 @@ void app_net_restore_httpd(void)
     (void)app_store_load_settings(&settings);
 
     /* Unconfigured: SoftAP portal is the only way in — never LAN-only. */
-    if (!settings.has_wifi) {
+    if (!settings_have_wifi(&settings)) {
         ESP_LOGW(TAG, "restore: no Wi-Fi creds — SoftAP portal");
         ensure_softap_portal();
         if (s_state != APP_NET_AP_MODE) set_state(APP_NET_AP_MODE);
@@ -1730,7 +1946,7 @@ void app_net_restore_httpd(void)
     /* STA lost during/after TLS: SoftAP for reconfig + keep STA trying. */
     ESP_LOGW(TAG, "restore after TLS but STA not up (state=%d); SoftAP+APSTA", (int)s_state);
     ensure_softap_portal();
-    if (settings.has_wifi && s_state != APP_NET_AP_MODE) {
+    if (settings_have_wifi(&settings) && s_state != APP_NET_AP_MODE) {
         ensure_apsta_keepalive();
         ensure_sta_softap_keepalive();
         set_state(APP_NET_STA_CONNECTING);

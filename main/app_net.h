@@ -16,7 +16,7 @@ typedef void (*app_net_cb_t)(app_net_state_t state, const char *ip_or_null);
 /**
  * Called after settings are written and the save HTTP response has been
  * sent (may run on a short-lived task, not the httpd task). stay_connected
- * is true when STA was already up with the same SSID/password. auto_fetch
+ * is true when STA was already up with the same Wi-Fi set. auto_fetch
  * is true only for the first provision (no stored article yet).
  */
 typedef void (*app_net_settings_saved_cb_t)(bool stay_connected, bool auto_fetch);
