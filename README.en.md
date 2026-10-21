@@ -4,11 +4,18 @@
 
 # Bathroom Short-Read
 
+> [!IMPORTANT]
+> **Learn the play and flash the firmware in your browser. Start on the community page:**
+>
+> ## [Bathroom Short-Read · community play (learn + browser flash)](https://ai-passport.folotoy.cn/plays/1427/?v=3375-3)
+>
+> This page is the best way to learn the play and to flash firmware directly in the browser. Use it for install and flash.
+
 ![Bathroom Short-Read](docs/assets/cover-bathroom-short-read.jpg)
 
 A Chinese short-reading play based on [FoloToy AI Passport](https://github.com/FoloToy/ai-passport).  
-Community page: [Bathroom Short-Read · AI Passport](https://ai-passport.folotoy.cn/plays/1427/)  
-Current version: **v1.2.0** · full firmware on the [Release](https://github.com/RadyWu/ai-passport/releases/tag/v1.2.0-bathroom-short-read)
+Current version: **v1.2.0** · play source is on branch `feature/bathroom-short-read`.  
+To download the firmware file yourself, use the secondary [Release v1.2.0](https://github.com/RadyWu/ai-passport/releases/tag/v1.2.0-bathroom-short-read).
 
 > The GitHub homepage is the Chinese `README.md` on the default branch `main`. Play source is on branch `feature/bathroom-short-read`.
 
@@ -44,6 +51,12 @@ It uses the fastest and cheapest model by default. API token use is tiny: during
 ---
 
 ## Download and flash
+
+**Preferred:** learn the play and flash in the browser from the community page:
+
+**[Bathroom Short-Read · community play (learn + browser flash)](https://ai-passport.folotoy.cn/plays/1427/?v=3375-3)**
+
+The GitHub Release is a secondary path when you want the firmware file itself:
 
 1. Open [v1.2.0 Bathroom Short Read](https://github.com/RadyWu/ai-passport/releases/tag/v1.2.0-bathroom-short-read)
 2. Download the full firmware `FoloToy-AI-Passport-full-v1.2.0-1021.bin`. `FoloToy-AI-Passport-full.bin` in the same Release is the latest full image, and the bytes are the same.
