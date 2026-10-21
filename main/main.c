@@ -68,14 +68,15 @@ static bool s_net_lost_modal_shown;
 
 static const char *SAMPLE_ARTICLE =
     "欢迎使用蹲坑阅读\n\n"
-    "请连接设备热点，\n"
+    "请连接设备热点\n"
     "在配置页填写\n"
     "DeepSeek API Key\n"
     "和偏好提示词\n\n"
-    "上下按钮单击翻页，\n"
+    "上下按钮单击翻页\n"
     "长按调节亮度\n"
     "长按OK键获取新内容\n\n"
-    "双击OK按钮或十分钟无操作，进入深度睡眠，可按任意键唤醒";
+    "双击OK按钮或十分钟无操作，进入深度睡眠\n"
+    "可按任意键唤醒";
 
 static void apply_article_text(const char *text)
 {
