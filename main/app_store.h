@@ -19,9 +19,10 @@ typedef struct {
     char wifi_ssid[APP_STORE_SSID_MAX];
     char wifi_pass[APP_STORE_PASS_MAX];
     /**
-     * Up to 3 networks, tried in order. Empty SSID slots are skipped.
+     * Up to 3 networks. Empty SSID slots are skipped.
      * Slot 0 uses the original NVS keys "ssid"/"pass" so v1.0.x devices keep Wi-Fi 1.
      * Slots 1 and 2 use "ssid2"/"pass2" and "ssid3"/"pass3".
+     * Which slot is tried first is the last success (`wpref`), not slot order.
      */
     app_wifi_cred_t wifi[APP_STORE_WIFI_SLOTS];
     char api_key[APP_STORE_API_KEY_MAX];
@@ -76,3 +77,11 @@ esp_err_t app_store_push_debug_prompt(const char *text);
 esp_err_t app_store_push_debug_raw(const char *text);
 esp_err_t app_store_load_debug_prompt(int position, char *buf, size_t buf_sz);
 esp_err_t app_store_load_debug_raw(int position, char *buf, size_t buf_sz);
+
+/**
+ * Last Wi-Fi slot that got an IP, as an index 0..2.
+ * Returns -1 when NVS has no preference yet. Does not log the SSID.
+ * Key "wpref" stores the slot number 1..3 so a missing value stays distinct.
+ */
+int app_store_load_wifi_pref(void);
+esp_err_t app_store_save_wifi_pref(int slot_index);

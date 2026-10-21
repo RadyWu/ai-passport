@@ -440,3 +440,31 @@ esp_err_t app_store_load_debug_raw(int position, char *buf, size_t buf_sz)
 {
     return load_debug_slot("lri", "lr0", "lr1", true, position, buf, buf_sz);
 }
+
+int app_store_load_wifi_pref(void)
+{
+    nvs_handle_t h;
+    uint8_t v = 0;
+    if (nvs_open(NS, NVS_READONLY, &h) != ESP_OK) return -1;
+    esp_err_t err = nvs_get_u8(h, "wpref", &v);
+    nvs_close(h);
+    if (err != ESP_OK || v < 1 || v > APP_STORE_WIFI_SLOTS) return -1;
+    return (int)v - 1;
+}
+
+esp_err_t app_store_save_wifi_pref(int slot_index)
+{
+    if (slot_index < 0 || slot_index >= APP_STORE_WIFI_SLOTS) return ESP_ERR_INVALID_ARG;
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+    err = nvs_set_u8(h, "wpref", (uint8_t)(slot_index + 1));
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "last-success Wi-Fi slot %d saved", slot_index + 1);
+    } else {
+        ESP_LOGW(TAG, "last-success Wi-Fi slot save: %s", esp_err_to_name(err));
+    }
+    return err;
+}

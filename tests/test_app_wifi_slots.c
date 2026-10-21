@@ -134,6 +134,94 @@ int main(void)
     set_slot(a, 1, "cafe", "c");
     assert(!app_wifi_driver_keeps_link(a, b, "cafe", "c"));
 
+    /*
+     * Scan-first order: last success first when that SSID is visible,
+     * then other visible slots in 1 → 2 → 3. Invisible slots are omitted.
+     */
+    const char *all_vis[] = {"home", "cafe", "office"};
+    int order[APP_WIFI_SLOTS];
+    memset(slots, 0, sizeof(slots));
+    set_slot(slots, 0, "home", "h");
+    set_slot(slots, 1, "cafe", "c");
+    set_slot(slots, 2, "office", "o");
+
+    assert(app_wifi_visible_try_order(slots, all_vis, 3, APP_WIFI_PREF_NONE, order) == 3);
+    assert(order[0] == 0 && order[1] == 1 && order[2] == 2);
+
+    assert(app_wifi_visible_try_order(slots, all_vis, 3, 2, order) == 3);
+    assert(order[0] == 2 && order[1] == 0 && order[2] == 1);
+
+    /* Last success out of range: only the visible filled slots, still 1 then 2. */
+    const char *home_cafe[] = {"cafe", "home"};
+    assert(app_wifi_visible_try_order(slots, home_cafe, 2, 2, order) == 2);
+    assert(order[0] == 0 && order[1] == 1);
+
+    /* Only Wi-Fi 3 is in range. Last success uses it; an older preference does not. */
+    const char *office_only[] = {"office", "neighbor"};
+    assert(app_wifi_visible_try_order(slots, office_only, 2, 2, order) == 1);
+    assert(order[0] == 2);
+    assert(app_wifi_visible_try_order(slots, office_only, 2, 0, order) == 1);
+    assert(order[0] == 2);
+
+    /* Nothing saved is visible: do not connect. */
+    const char *strangers[] = {"other", "guest"};
+    assert(app_wifi_visible_try_order(slots, strangers, 2, 2, order) == 0);
+    assert(app_wifi_visible_try_order(slots, NULL, 0, 0, order) == 0);
+
+    /* No preference yet: visible slots keep 1 → 2 → 3, holes skipped. */
+    memset(slots, 0, sizeof(slots));
+    set_slot(slots, 0, "home", "h");
+    set_slot(slots, 2, "office", "o");
+    const char *home_office[] = {"office", "home"};
+    assert(app_wifi_visible_try_order(slots, home_office, 2, APP_WIFI_PREF_NONE, order) == 2);
+    assert(order[0] == 0 && order[1] == 2);
+
+    /* Preferred slot empty or out of range is ignored. */
+    assert(app_wifi_visible_try_order(slots, home_office, 2, 1, order) == 2);
+    assert(order[0] == 0 && order[1] == 2);
+    assert(app_wifi_visible_try_order(slots, home_office, 2, 9, order) == 2);
+    assert(order[0] == 0 && order[1] == 2);
+
+    /* ASCII letter case is ignored. A shorter name is not a prefix match. */
+    const char *almost[] = {"home-2", "HOME_1"};
+    assert(!app_wifi_ssid_visible("home", almost, 2));
+    assert(app_wifi_ssid_visible("home_1", almost, 2));
+    assert(app_wifi_visible_try_order(slots, almost, 2, 0, order) == 0);
+    const char *dup_home[] = {"home", "home"};
+    assert(app_wifi_ssid_visible("home", dup_home, 2));
+
+    /*
+     * Hand-typed case still counts as visible. The join name is the scan
+     * entry's exact bytes, and the first scan hit wins.
+     */
+    memset(slots, 0, sizeof(slots));
+    set_slot(slots, 0, "MyWifi", "h");
+    set_slot(slots, 2, "Cafe", "c");
+    const char *folded[] = {"MYWIFI", "cafe"};
+    assert(app_wifi_ssid_visible("MyWifi", folded, 2));
+    assert(app_wifi_ssid_visible("mywifi", folded, 2));
+    assert(app_wifi_visible_try_order(slots, folded, 2, APP_WIFI_PREF_NONE, order) == 2);
+    assert(order[0] == 0 && order[1] == 2);
+    assert(app_wifi_visible_try_order(slots, folded, 2, 2, order) == 2);
+    assert(order[0] == 2 && order[1] == 0);
+    const char *scanned = app_wifi_scan_ssid("MyWifi", folded, 2);
+    assert(scanned && strcmp(scanned, "MYWIFI") == 0);
+    scanned = app_wifi_scan_ssid("Cafe", folded, 2);
+    assert(scanned && strcmp(scanned, "cafe") == 0);
+    const char *both_cases[] = {"mywifi", "MYWIFI"};
+    scanned = app_wifi_scan_ssid("MyWifi", both_cases, 2);
+    assert(scanned && strcmp(scanned, "mywifi") == 0);
+    assert(app_wifi_scan_ssid("other", folded, 2) == NULL);
+    assert(app_wifi_scan_ssid("", folded, 2) == NULL);
+
+    /* Fallback walks the visible list once and stops. */
+    int vis_order[] = {2, 0, 1};
+    assert(app_wifi_order_after(vis_order, 3, 2) == 0);
+    assert(app_wifi_order_after(vis_order, 3, 0) == 1);
+    assert(app_wifi_order_after(vis_order, 3, 1) == -1);
+    assert(app_wifi_order_after(vis_order, 3, 4) == -1);
+    assert(app_wifi_order_after(vis_order, 0, 2) == -1);
+
     puts("test_app_wifi_slots: PASS");
     return 0;
 }
