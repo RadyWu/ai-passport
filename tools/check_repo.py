@@ -32,8 +32,13 @@ ROOT_MARKDOWN_ALLOWLIST = {
     "CLAUDE.md",
     "CLAUDE.zh_CN.md",
     "README.md",
+    "README.en.md",
     "README.zh_CN.md",
 }
+# The GitHub homepage is Chinese README.md. README.en.md is its English twin.
+# It is not a second default document and does not use a README.en.zh_CN.md peer.
+HOMEPAGE_ZH = "README.md"
+HOMEPAGE_EN = "README.en.md"
 # Register only concrete, vendored component directories, e.g. "components/foo".
 # These exemptions never change the input to sensitive-content/conflict checks.
 VENDORED_DOC_ROOTS: tuple[str, ...] = ()
@@ -228,6 +233,33 @@ def check_document_languages(
             elif default_name not in opening:
                 errors.append(
                     f"{path.relative_to(ROOT).as_posix()}: missing top language link to {default_name}"
+                )
+            continue
+
+        if path.parent == ROOT and name == HOMEPAGE_ZH:
+            english_home = path.with_name(HOMEPAGE_EN)
+            if english_home not in markdown:
+                errors.append(
+                    f"{path.relative_to(ROOT).as_posix()}: missing English homepage {HOMEPAGE_EN}"
+                )
+            continue
+
+        if path.parent == ROOT and name == HOMEPAGE_EN:
+            chinese_home = path.with_name(HOMEPAGE_ZH)
+            if chinese_home not in markdown:
+                errors.append(
+                    f"{path.relative_to(ROOT).as_posix()}: missing Chinese homepage {HOMEPAGE_ZH}"
+                )
+            elif HOMEPAGE_ZH not in opening:
+                errors.append(
+                    f"{path.relative_to(ROOT).as_posix()}: missing top language link to {HOMEPAGE_ZH}"
+                )
+            english_prose = text.replace("简体中文", "")
+            match = CJK_RE.search(english_prose)
+            if match:
+                line = english_prose.count("\n", 0, match.start()) + 1
+                errors.append(
+                    f"{path.relative_to(ROOT).as_posix()}:{line}: default Markdown must use English prose"
                 )
             continue
 
