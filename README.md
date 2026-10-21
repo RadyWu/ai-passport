@@ -4,12 +4,18 @@
 
 # 蹲坑阅读神器（解闷阅读）
 
+> [!IMPORTANT]
+> **学玩法、在浏览器里直接刷机，请先打开社区页面：**
+>
+> ## [蹲坑阅读神器 · 社区玩法（学玩法 + 浏览器刷机）](https://ai-passport.folotoy.cn/plays/1427/?v=3375-3)
+>
+> 这是了解本玩法、并直接在浏览器刷入固件的最佳方式。安装与刷机请走这一页。
+
 ![蹲坑阅读神器](docs/assets/cover-bathroom-short-read.jpg)
 
-
 基于 [FoloToy AI Passport](https://github.com/FoloToy/ai-passport) 的中文短文阅读玩法。  
-社区页面：[蹲坑阅读神器 · AI Passport](https://ai-passport.folotoy.cn/plays/1427/)  
-当前版本：**v1.2.0** · 完整固件见 [Release](https://github.com/RadyWu/ai-passport/releases/tag/v1.2.0-bathroom-short-read)
+当前版本：**v1.2.0** · 玩法代码在分支 `feature/bathroom-short-read`。  
+只需自行下载固件包时，备用入口是 [Release v1.2.0](https://github.com/RadyWu/ai-passport/releases/tag/v1.2.0-bathroom-short-read)。
 
 > 本仓库面向中文用户。玩法代码在分支 `feature/bathroom-short-read`。
 
@@ -45,6 +51,12 @@
 ---
 
 ## 下载与刷机
+
+**推荐：** 在社区页面了解玩法，并直接在浏览器里刷机：
+
+**[蹲坑阅读神器 · 社区玩法（学玩法 + 浏览器刷机）](https://ai-passport.folotoy.cn/plays/1427/?v=3375-3)**
+
+GitHub Release 是备用入口，给需要自行下载固件包的人：
 
 1. 打开 [v1.2.0 Bathroom Short Read](https://github.com/RadyWu/ai-passport/releases/tag/v1.2.0-bathroom-short-read)
 2. 下载完整固件 `FoloToy-AI-Passport-full-v1.2.0-1021.bin`（同一 Release 中的 `FoloToy-AI-Passport-full.bin` 为最新完整固件，内容相同）
