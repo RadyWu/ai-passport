@@ -55,3 +55,24 @@ esp_err_t app_store_save_brightness(uint8_t level_1_to_6);
 /** Article page index (0-based) for resume after deep sleep. */
 uint16_t app_store_load_page(void);
 esp_err_t app_store_save_page(uint16_t page);
+
+/**
+ * Last two DeepSeek debug strings, newest first, kept across reboot.
+ * Namespace "toilet". A third push overwrites only the oldest slot.
+ *
+ *   spi  u8     prompt ring (count<<2 | newest slot)
+ *   sp0  str    system prompt slot, APP_DEBUG_PROMPT_MAX including NUL
+ *   sp1  str    the other prompt slot
+ *   lri  u8     raw-reply ring, same packing
+ *   lr0  blob   assistant text, APP_DEBUG_RAW_MAX including NUL
+ *   lr1  blob   the other raw slot
+ *
+ * Prompts are NVS strings (under the ~4000-byte page limit). Raw replies are
+ * blobs so they can hold a full parsed article. Store failures are returned
+ * and must not fail the article fetch. position 0 is newest; a missing slot
+ * writes "".
+ */
+esp_err_t app_store_push_debug_prompt(const char *text);
+esp_err_t app_store_push_debug_raw(const char *text);
+esp_err_t app_store_load_debug_prompt(int position, char *buf, size_t buf_sz);
+esp_err_t app_store_load_debug_raw(int position, char *buf, size_t buf_sz);

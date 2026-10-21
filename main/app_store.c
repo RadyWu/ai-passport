@@ -1,9 +1,11 @@
 #include "app_store.h"
 #include "app_article.h"
+#include "app_debug_log.h"
 #include "esp_log.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* Slot 0 keeps the v1.0.x keys. Slots 1 and 2 are additive. */
@@ -297,4 +299,144 @@ esp_err_t app_store_save_page(uint16_t page)
     if (err == ESP_OK) err = nvs_commit(h);
     nvs_close(h);
     return err;
+}
+
+/*
+ * Debug strings share the 64 KiB NVS partition with Wi-Fi, the article blob,
+ * and topic keys. Live entries after a full article plus two prompts and two
+ * raw replies stay under half of the ~1890 usable entries (15 pages x 126),
+ * including the extra page a raw-blob update needs before the old value is
+ * erased. Caps: prompt 2048 (string), raw 8192 (blob).
+ */
+
+static void finish_nvs_string(char *buf, size_t buf_sz, size_t len, esp_err_t err)
+{
+    if (!buf || buf_sz == 0) return;
+    if (err != ESP_OK || len == 0) {
+        buf[0] = '\0';
+        return;
+    }
+    if (len >= buf_sz) buf[buf_sz - 1] = '\0';
+    else if (buf[len - 1] != '\0') buf[len] = '\0';
+}
+
+static esp_err_t load_debug_slot(const char *index_key, const char *key0, const char *key1,
+                                 bool is_blob, int position, char *buf, size_t buf_sz)
+{
+    nvs_handle_t h;
+    uint8_t packed = 0;
+    app_debug_ring_t ring;
+    int slot;
+    const char *key;
+    size_t len;
+    esp_err_t err;
+
+    if (!buf || buf_sz == 0) return ESP_ERR_INVALID_ARG;
+    buf[0] = '\0';
+    if (position < 0 || position >= APP_DEBUG_SLOTS) return ESP_ERR_INVALID_ARG;
+
+    err = nvs_open(NS, NVS_READONLY, &h);
+    if (err != ESP_OK) return ESP_OK;
+
+    (void)nvs_get_u8(h, index_key, &packed);
+    app_debug_ring_unpack(packed, &ring);
+    slot = app_debug_ring_at(&ring, position);
+    if (slot < 0) {
+        nvs_close(h);
+        return ESP_OK;
+    }
+    key = slot ? key1 : key0;
+    len = buf_sz;
+    err = is_blob ? nvs_get_blob(h, key, buf, &len) : nvs_get_str(h, key, buf, &len);
+    nvs_close(h);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        buf[0] = '\0';
+        return ESP_OK;
+    }
+    if (err != ESP_OK) {
+        buf[0] = '\0';
+        return err;
+    }
+    finish_nvs_string(buf, buf_sz, len, err);
+    return ESP_OK;
+}
+
+static esp_err_t write_debug_value(nvs_handle_t h, const char *key, bool is_blob,
+                                   const char *text, bool keep_tail, size_t cap)
+{
+    static const size_t shrink[] = { 4096, 2048, 1024, 512 };
+    char *stored;
+    size_t n;
+    esp_err_t err;
+    size_t i;
+
+    if (cap == 0) return ESP_ERR_INVALID_ARG;
+    stored = malloc(cap);
+    if (!stored) return ESP_ERR_NO_MEM;
+    n = app_debug_capture(stored, cap, text, keep_tail, false);
+    err = is_blob ? nvs_set_blob(h, key, stored, n + 1) : nvs_set_str(h, key, stored);
+    if (err == ESP_ERR_NVS_TYPE_MISMATCH) {
+        (void)nvs_erase_key(h, key);
+        err = is_blob ? nvs_set_blob(h, key, stored, n + 1) : nvs_set_str(h, key, stored);
+    }
+    for (i = 0; err == ESP_ERR_NVS_NOT_ENOUGH_SPACE && i < sizeof(shrink) / sizeof(shrink[0]); i++) {
+        size_t next = shrink[i];
+        if (next >= cap) continue;
+        n = app_debug_capture(stored, next, text, keep_tail, false);
+        ESP_LOGW(TAG, "debug %s shrink to %u (len %u)", key, (unsigned)next, (unsigned)n);
+        err = is_blob ? nvs_set_blob(h, key, stored, n + 1) : nvs_set_str(h, key, stored);
+        cap = next;
+    }
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "debug %s stored len=%u", key, (unsigned)n);
+    } else {
+        ESP_LOGW(TAG, "debug %s store failed: %s", key, esp_err_to_name(err));
+    }
+    free(stored);
+    return err;
+}
+
+static esp_err_t push_debug_slot(const char *index_key, const char *key0, const char *key1,
+                                 bool is_blob, bool keep_tail, size_t cap, const char *text)
+{
+    nvs_handle_t h;
+    uint8_t packed = 0;
+    app_debug_ring_t ring;
+    int slot;
+    const char *key;
+    esp_err_t err;
+
+    if (!text || !text[0]) return ESP_ERR_INVALID_ARG;
+    err = nvs_open(NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+
+    (void)nvs_get_u8(h, index_key, &packed);
+    app_debug_ring_unpack(packed, &ring);
+    slot = app_debug_ring_push(&ring);
+    key = slot ? key1 : key0;
+    err = write_debug_value(h, key, is_blob, text, keep_tail, cap);
+    if (err == ESP_OK) err = nvs_set_u8(h, index_key, app_debug_ring_pack(&ring));
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    return err;
+}
+
+esp_err_t app_store_push_debug_prompt(const char *text)
+{
+    return push_debug_slot("spi", "sp0", "sp1", false, false, APP_DEBUG_PROMPT_MAX, text);
+}
+
+esp_err_t app_store_push_debug_raw(const char *text)
+{
+    return push_debug_slot("lri", "lr0", "lr1", true, true, APP_DEBUG_RAW_MAX, text);
+}
+
+esp_err_t app_store_load_debug_prompt(int position, char *buf, size_t buf_sz)
+{
+    return load_debug_slot("spi", "sp0", "sp1", false, position, buf, buf_sz);
+}
+
+esp_err_t app_store_load_debug_raw(int position, char *buf, size_t buf_sz)
+{
+    return load_debug_slot("lri", "lr0", "lr1", true, position, buf, buf_sz);
 }
