@@ -60,6 +60,8 @@ Fork 发布 **Bathroom Short-Read（解闷阅读）**，分支 `feature/bathroom
 
 配置页可查看最近两次发给 AI 的系统提示词和返回原文，方便排查。连网改为先扫描周围热点，只尝试你填过且当前能搜到的 Wi‑Fi，并优先连上次成功的那组；SSID 匹配不区分大小写。另修复了「已写话题」与随机种子粘在一起的问题。
 
+尚未保存短文时，开机显示指定的欢迎说明。
+
 ## v1.1.0-bathroom-short-read - 2026-10-21
 
 Fork 发布 **Bathroom Short-Read（解闷阅读）**，分支 `feature/bathroom-short-read`。

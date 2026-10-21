@@ -64,6 +64,7 @@ Fork release of **Bathroom Short-Read** on branch `feature/bathroom-short-read`.
 - The config page shows the last two system prompts sent to the AI and the last two raw replies, for troubleshooting.
 - Connecting scans nearby hotspots first and tries only saved Wi-Fi networks that are currently visible, preferring the last successful one. SSID matching ignores letter case.
 - Avoided topics no longer stick to the random seed.
+- Before an article is saved, boot shows the supplied welcome text.
 
 ## v1.1.0-bathroom-short-read - 2026-10-21
 
