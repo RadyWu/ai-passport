@@ -57,6 +57,15 @@
 - Added the documentation catalog and task-triggered routing based on the earlier repository model.
 - Added bilingual contribution, code-of-conduct, security, and support documents tailored to this ESP-IDF and fork workflow.
 
+## v1.1.0-bathroom-short-read - 2026-10-21
+
+Fork release of **Bathroom Short-Read** on branch `feature/bathroom-short-read`.
+
+- The config page stores up to three 2.4 GHz Wi-Fi networks (Wi-Fi 1, Wi-Fi 2, and Wi-Fi 3). Saved names are prefilled. Empty names are skipped, and one filled network is enough.
+- On boot, after a save, and while searching, non-empty networks are tried in order 1 then 2 then 3. The first network that gets an IP is used.
+- The Wi-Fi failure screen, with SoftAP left up for another try, appears only after every filled network has failed. A save still disconnects and joins the new set immediately, starting at Wi-Fi 1. Later saves do not replace the stored article.
+- Wi-Fi 1 stays on the original NVS keys. Wi-Fi 2 and Wi-Fi 3 use additional keys, so a device configured with v1.0.x still loads its single network.
+
 ## v1.0.1-bathroom-short-read - 2026-10-20
 
 Fork release of **Bathroom Short-Read** on branch `feature/bathroom-short-read`.

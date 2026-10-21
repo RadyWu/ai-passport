@@ -54,6 +54,15 @@
 - 参考 cindy 仓库文档组织完善索引：新增 `docs/README.md` 根总索引；AGENTS.md 规则索引按触发场景改写（附触发条件）；`docs/contribution/` 与 `docs/development/` 的 README 补充收录标准。
 - 引入社区治理文档（参照 cindy 改写，放仓库根目录）：新增 `CONTRIBUTING.md` / `.zh_CN.md`（贡献指南，针对 ESP-IDF/AI agent/fork 场景改写）、`CODE_OF_CONDUCT.md` / `.zh_CN.md`（贡献者公约）、`SECURITY.md` / `.zh_CN.md`（安全报告流程）、`SUPPORT.md` / `.zh_CN.md`（支持渠道）；AGENTS.md 与 docs/README.md 同步引用。
 
+## v1.1.0-bathroom-short-read - 2026-10-21
+
+Fork 发布 **Bathroom Short-Read（解闷阅读）**，分支 `feature/bathroom-short-read`。
+
+- 配置页可保存最多 3 个 2.4 GHz Wi‑Fi（Wi‑Fi 1、2、3）。已保存的名称会填回输入框。空着的名称会跳过，只填一个也可以。
+- 开机、保存后以及断网重试时，按 1 → 2 → 3 尝试已填写的网络，连上一个并拿到 IP 就停止。
+- 只有全部已填网络都连不上时，才出现 Wi‑Fi 失败界面，且 SoftAP 保持开启以便马上重配。保存后会立刻断开并按新的一组去连接，从 Wi‑Fi 1 开始。之后再次保存仍不会覆盖已有短文。
+- Wi‑Fi 1 仍使用原来的 NVS 键。Wi‑Fi 2、3 使用新增键，因此 v1.0.x 只配过一组网络的设备仍能读出。
+
 ## v1.0.1-bathroom-short-read - 2026-10-20
 
 Fork 发布 **Bathroom Short-Read（解闷阅读）**，分支 `feature/bathroom-short-read`。
