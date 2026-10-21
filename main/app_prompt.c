@@ -78,8 +78,9 @@ int app_prompt_build_system(char *out, size_t out_sz,
         for (i = 0; i < APP_PROMPT_TOPIC_SLOTS; i++) {
             int n;
             if (!topics[i][0]) continue;
-            n = snprintf(avoid + ao, sizeof(avoid) - ao, "%s%s",
-                         ao ? "；" : "", topics[i]);
+            /* Trailing ； after every title, including the last, so the
+             * next title and the following 种子 stay separated. */
+            n = snprintf(avoid + ao, sizeof(avoid) - ao, "%s；", topics[i]);
             if (n < 0) break;
             if ((size_t)n >= sizeof(avoid) - ao) {
                 ao = sizeof(avoid) - 1;

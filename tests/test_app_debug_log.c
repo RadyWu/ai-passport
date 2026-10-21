@@ -131,17 +131,30 @@ static void test_prompt(void)
     n = app_prompt_build_system(out, sizeof(out), "冷知识", topics, 42);
     assert(n > 0);
     assert(strstr(out, "偏好：冷知识。") != NULL);
-    assert(strstr(out, "以下话题已写过，勿重复：苹果；月亮") != NULL);
-    assert(strstr(out, "种子42。") != NULL);
+    assert(strstr(out, "以下话题已写过，勿重复：苹果；月亮；种子42。") != NULL);
+    assert(strstr(out, "月亮种子") == NULL);
+
+    memset(topics, 0, sizeof(topics));
+    strcpy(topics[0], "模型精度");
+    n = app_prompt_build_system(out, sizeof(out), "冷知识", topics, 122463);
+    assert(strstr(out, "以下话题已写过，勿重复：模型精度；种子122463。") != NULL);
+    assert(strstr(out, "模型精度种子") == NULL);
+
+    memset(topics, 0, sizeof(topics));
+    strcpy(topics[0], "标题甲");
+    strcpy(topics[2], "标题乙");
+    strcpy(topics[4], "标题丙");
+    n = app_prompt_build_system(out, sizeof(out), "冷知识", topics, 123456);
+    assert(strstr(out, "以下话题已写过，勿重复：标题甲；标题乙；标题丙；种子123456。") != NULL);
     assert(strstr(out, "1500") != NULL);
     assert(strstr(out, "2000") != NULL);
     assert(strstr(out, APP_DEBUG_TRUNC_MARK) == NULL);
     assert(strstr(out, "{") == NULL);
 
     n = app_prompt_build_system(out, sizeof(out), "A\nB\tC", NULL, 7);
-    assert(strstr(out, "偏好：ABC。") != NULL);
+    assert(strstr(out, "偏好：ABC。种子7。") != NULL);
     assert(strstr(out, "以下话题") == NULL);
-    assert(strstr(out, "种子7。") != NULL);
+    assert(strstr(out, "；种子") == NULL);
 
     n = app_prompt_build_system(out, sizeof(out), "", NULL, 1);
     assert(strstr(out, "轻松有趣的冷知识或生活小故事") != NULL);
@@ -158,7 +171,7 @@ static void test_prompt(void)
     assert(n > 0);
     assert(n < APP_PROMPT_SYS_MAX);
     assert(strstr(out, APP_DEBUG_TRUNC_MARK) == NULL);
-    assert(strstr(out, "种子4294967295。") != NULL);
+    assert(strstr(out, "；种子4294967295。") != NULL);
     assert(strstr(out, worst_pref) != NULL);
 
     n = app_prompt_build_system(tiny, sizeof(tiny), "冷知识", NULL, 1);
