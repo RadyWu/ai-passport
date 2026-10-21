@@ -2,9 +2,18 @@
 /**
  * Ordered Wi-Fi credential slots (exactly 3).
  *
- * Host-testable: no ESP-IDF or NVS. Slot 0 is Wi-Fi 1 and is tried first.
- * Empty SSIDs are skipped. A join budget is per slot; the all-failed result
- * happens only after every filled slot has used its budget, walking 1 → 2 → 3.
+ * Host-testable: no ESP-IDF or NVS. Empty SSIDs are skipped.
+ *
+ * Connect order is scan-first (`app_wifi_visible_try_order`):
+ *   1. Keep filled slots whose SSID was in the latest scan.
+ *   2. If `preferred` (last slot that got an IP, or APP_WIFI_PREF_NONE)
+ *      is one of those, try it first.
+ *   3. Then the other visible slots in index order (Wi-Fi 1 → 2 → 3).
+ * Filled slots absent from the scan are not tried. A zero-length order means
+ * do not connect. With no preferred slot, visible slots stay in order 1 → 2 → 3.
+ *
+ * `app_wifi_on_fail` is the per-slot join budget while walking a candidate
+ * list. `app_wifi_order_after` steps a visible order and does not wrap.
  */
 #include <stdbool.h>
 #include <string.h>
@@ -29,6 +38,75 @@ static inline int app_wifi_first_slot(const app_wifi_cred_t slots[APP_WIFI_SLOTS
     if (!slots) return -1;
     for (int i = 0; i < APP_WIFI_SLOTS; i++) {
         if (app_wifi_slot_filled(&slots[i])) return i;
+    }
+    return -1;
+}
+
+/** No stored last-success slot. */
+#define APP_WIFI_PREF_NONE (-1)
+
+/**
+ * True when `ssid` equals one scan entry.
+ * Match is case-sensitive and limited to the 32-character SSID field.
+ * Empty names never match.
+ */
+static inline bool app_wifi_ssid_visible(const char *ssid,
+                                         const char *const *visible,
+                                         int visible_count)
+{
+    if (!ssid || ssid[0] == '\0' || !visible || visible_count <= 0) return false;
+    for (int i = 0; i < visible_count; i++) {
+        const char *got = visible[i];
+        if (!got || got[0] == '\0') continue;
+        if (strncmp(ssid, got, APP_WIFI_SSID_MAX) == 0) return true;
+    }
+    return false;
+}
+
+/**
+ * Visible-slot connect order.
+ * Writes slot indexes into `order` and returns how many to try (0 = none).
+ * `preferred` is tried first when that slot is filled and its SSID is visible;
+ * remaining visible slots follow in ascending index. Invisible slots are omitted.
+ */
+static inline int app_wifi_visible_try_order(
+    const app_wifi_cred_t slots[APP_WIFI_SLOTS],
+    const char *const *visible,
+    int visible_count,
+    int preferred,
+    int order[APP_WIFI_SLOTS])
+{
+    if (order) {
+        for (int i = 0; i < APP_WIFI_SLOTS; i++) order[i] = -1;
+    }
+    if (!slots || !order) return 0;
+
+    int n = 0;
+    if (preferred >= 0 && preferred < APP_WIFI_SLOTS
+        && app_wifi_slot_filled(&slots[preferred])
+        && app_wifi_ssid_visible(slots[preferred].ssid, visible, visible_count)) {
+        order[n++] = preferred;
+    }
+    for (int i = 0; i < APP_WIFI_SLOTS; i++) {
+        if (n > 0 && i == order[0]) continue;
+        if (!app_wifi_slot_filled(&slots[i])) continue;
+        if (!app_wifi_ssid_visible(slots[i].ssid, visible, visible_count)) continue;
+        order[n++] = i;
+    }
+    return n;
+}
+
+/**
+ * Next slot in a visible order after `current`, or -1 when `current` is last
+ * or not in the list. Does not wrap; the caller rescans or takes all-failed.
+ */
+static inline int app_wifi_order_after(const int order[], int count, int current)
+{
+    if (!order || count <= 0 || current < 0) return -1;
+    for (int i = 0; i < count && i < APP_WIFI_SLOTS; i++) {
+        if (order[i] == current) {
+            return (i + 1 < count) ? order[i + 1] : -1;
+        }
     }
     return -1;
 }

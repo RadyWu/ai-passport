@@ -72,7 +72,7 @@ static volatile bool s_cred_watch;
 static volatile bool s_cred_gave_up;
 /**
  * Which saved slot the driver should be using (0..2), or -1 before the first
- * install. Failures on this slot advance 1 → 2 → 3; empty SSIDs are skipped.
+ * install. Candidates are the scan intersection, not every filled slot.
  */
 static int s_active_slot = -1;
 /** Join failures already counted on s_active_slot (not including the next one). */
@@ -80,11 +80,38 @@ static int s_slot_fails;
 /** Driver STA profile is not s_active_slot yet; next connect must set_config. */
 static volatile bool s_slot_reload;
 /**
- * Join failures on the current slot before trying the next saved network.
- * One filled slot still waits for this many failures before the existing
- * all-failed screen (same budget as the single-SSID firmware).
+ * Join failures on the current visible slot before the next visible one.
+ * One visible slot still uses this budget (same as the single-SSID firmware).
+ * An absent-AP reason skips the rest of the budget.
  */
 #define CRED_JOIN_FAIL_MAX 3
+/**
+ * Empty scans before the all-failed / SoftAP path when no saved name is in
+ * range. Two scans absorb one missed sweep during a short flap. Neither
+ * calls connect(), so an invisible network does not add a join timeout.
+ */
+#define STA_EMPTY_SCAN_MAX 2
+#define STA_EMPTY_RESCAN_MS 1500
+/** Scan records kept for the SSID intersection (capped). */
+#define STA_SCAN_MAX 16
+/** Last slot that got an IP (0..2), or -1 when NVS has no preference yet. */
+static int s_pref_slot = -1;
+/** Slot index waiting for an NVS write, or -1. */
+static volatile int s_pref_dirty = -1;
+static char s_visible[STA_SCAN_MAX][APP_WIFI_SSID_MAX];
+static int s_visible_n;
+static wifi_ap_record_t s_scan_recs[STA_SCAN_MAX];
+static int s_try_order[APP_WIFI_SLOTS];
+static int s_try_n;
+static bool s_try_valid;
+/** Next choice must scan. Invisible saved SSIDs are not joined. */
+static bool s_need_scan = true;
+static int s_empty_scans;
+static volatile bool s_pick_busy;
+static volatile bool s_scan_task_busy;
+static int s_scan_delay_ms;
+static int s_pending_rescan_ms = -1;
+static TickType_t s_last_scan_tick;
 /** Serialize stop/start httpd (boot, outage, GOT_IP, phone-join watch). */
 static SemaphoreHandle_t s_httpd_mu;
 
@@ -112,6 +139,11 @@ static int active_slot_index(const app_wifi_cred_t slots[APP_WIFI_SLOTS]);
 /** Load Wi-Fi slots without putting app_settings_t on a small event stack. */
 static bool load_wifi_slots(app_wifi_cred_t slots[APP_WIFI_SLOTS]);
 static bool settings_have_wifi(const app_settings_t *s);
+static void schedule_softap_for_outage(void);
+static void schedule_scan_pick(int delay_ms);
+static void persist_wifi_pref_if_dirty(void);
+static void sta_pick_and_connect(const app_wifi_cred_t slots[APP_WIFI_SLOTS],
+                                 const char *why, bool from_apply);
 
 static void set_state(app_net_state_t st)
 {
@@ -500,7 +532,7 @@ static void save_followup_task(void *arg)
     }
 
     if (f->apply_sta) {
-        /* Drop the in-flight STA attempt, then install slot 1 (or the first filled). */
+        /* Drop the in-flight STA attempt, then scan and join a visible saved slot. */
         apply_saved_sta(true);
     } else if (!f->stay_connected) {
         ESP_LOGW(TAG, "settings saved but ssid empty — stay SoftAP, no STA connect");
@@ -787,7 +819,7 @@ static esp_err_t save_post(httpd_req_t *req)
     f->stay_connected = stay_connected;
     f->auto_fetch = action.auto_fetch;
     f->apply_sta = action.apply_sta;
-    if (xTaskCreate(save_followup_task, "save_fu", 4096, f, 5, NULL) != pdPASS) {
+    if (xTaskCreate(save_followup_task, "save_fu", 6144, f, 5, NULL) != pdPASS) {
         ESP_LOGE(TAG, "followup task create failed");
         free(f);
         vTaskDelay(pdMS_TO_TICKS(750));
@@ -1194,11 +1226,301 @@ static void install_sta_slot(const app_settings_t *s, int idx)
     }
 }
 
+static void persist_wifi_pref_if_dirty(void)
+{
+    int slot = s_pref_dirty;
+    if (slot < 0 || slot >= APP_WIFI_SLOTS) return;
+    if (app_store_save_wifi_pref(slot) == ESP_OK) {
+        if (s_pref_dirty == slot) s_pref_dirty = -1;
+    }
+}
+
+static bool scan_recent(void)
+{
+    if (s_last_scan_tick == 0) return false;
+    return (xTaskGetTickCount() - s_last_scan_tick) < pdMS_TO_TICKS(2000);
+}
+
+static bool reason_ap_absent(uint8_t reason)
+{
+    switch (reason) {
+    case WIFI_REASON_NO_AP_FOUND:
+    case WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY:
+    case WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD:
+    case WIFI_REASON_NO_AP_FOUND_IN_RSSI_THRESHOLD:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/** Drop a scan result the driver is still holding. */
+static void sta_scan_release(void)
+{
+    uint16_t zero = 0;
+    wifi_ap_record_t discard;
+    (void)esp_wifi_scan_get_ap_records(&zero, &discard);
+}
+
 /**
- * Count a join failure against the active slot. On budget exhaustion, move to
- * the next filled slot (1 → 2 → 3, skipping empties). EXHAUSTED means every
- * filled slot has been tried; a credential apply then uses the existing
- * failure screen, and search wraps to the first filled slot.
+ * Blocking scan. Call only off the Wi-Fi event task: SCAN_DONE is delivered
+ * on that task, so a blocking scan there deadlocks.
+ * Returns 1 on a finished scan, 0 when the scan did not run (caller may try
+ * one slot), and -1 when the radio is busy (caller must not connect).
+ */
+static int sta_collect_scan(void)
+{
+    wifi_scan_config_t cfg = { 0 };
+    cfg.show_hidden = false;
+    cfg.scan_type = WIFI_SCAN_TYPE_ACTIVE;
+    s_visible_n = 0;
+    esp_err_t err = esp_wifi_scan_start(&cfg, true);
+    if (err == ESP_ERR_WIFI_STATE) {
+        ESP_LOGW(TAG, "STA scan busy: %s", esp_err_to_name(err));
+        return -1;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "STA scan start: %s", esp_err_to_name(err));
+        return 0;
+    }
+    uint16_t num = 0;
+    if (esp_wifi_scan_get_ap_num(&num) != ESP_OK) {
+        sta_scan_release();
+        ESP_LOGW(TAG, "STA scan ap_num failed");
+        return 0;
+    }
+    if (num == 0) {
+        sta_scan_release();
+        s_last_scan_tick = xTaskGetTickCount();
+        ESP_LOGI(TAG, "STA scan saw 0 APs");
+        return 1;
+    }
+    /* s_scan_recs is BSS so a scan during httpd does not need a heap block. */
+    uint16_t cap = num > STA_SCAN_MAX ? STA_SCAN_MAX : num;
+    uint16_t got = cap;
+    err = esp_wifi_scan_get_ap_records(&got, s_scan_recs);
+    if (err != ESP_OK) {
+        sta_scan_release();
+        ESP_LOGW(TAG, "STA scan records: %s", esp_err_to_name(err));
+        return 0;
+    }
+    for (uint16_t i = 0; i < got && s_visible_n < STA_SCAN_MAX; i++) {
+        if (s_scan_recs[i].ssid[0] == '\0') continue;
+        memcpy(s_visible[s_visible_n], s_scan_recs[i].ssid, APP_WIFI_SSID_MAX - 1);
+        s_visible[s_visible_n][APP_WIFI_SSID_MAX - 1] = '\0';
+        bool dup = false;
+        for (int j = 0; j < s_visible_n; j++) {
+            if (strncmp(s_visible[j], s_visible[s_visible_n], APP_WIFI_SSID_MAX) == 0) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) s_visible_n++;
+    }
+    s_last_scan_tick = xTaskGetTickCount();
+    ESP_LOGI(TAG, "STA scan aps=%u unique=%d", (unsigned)num, s_visible_n);
+    return 1;
+}
+
+static void publish_try_order(const app_wifi_cred_t slots[APP_WIFI_SLOTS])
+{
+    const char *ptrs[STA_SCAN_MAX];
+    int nvis = s_visible_n;
+    if (nvis > STA_SCAN_MAX) nvis = STA_SCAN_MAX;
+    for (int i = 0; i < nvis; i++) ptrs[i] = s_visible[i];
+    s_try_n = app_wifi_visible_try_order(slots, ptrs, nvis, s_pref_slot, s_try_order);
+    s_try_valid = true;
+    ESP_LOGI(TAG, "visible order n=%d slots=%d/%d/%d pref=%d",
+             s_try_n,
+             s_try_n > 0 ? s_try_order[0] + 1 : 0,
+             s_try_n > 1 ? s_try_order[1] + 1 : 0,
+             s_try_n > 2 ? s_try_order[2] + 1 : 0,
+             s_pref_slot >= 0 ? s_pref_slot + 1 : 0);
+}
+
+static int fallback_slot(const app_wifi_cred_t slots[APP_WIFI_SLOTS])
+{
+    if (s_pref_slot >= 0 && s_pref_slot < APP_WIFI_SLOTS
+        && app_wifi_slot_filled(&slots[s_pref_slot])) {
+        return s_pref_slot;
+    }
+    return app_wifi_first_slot(slots);
+}
+
+static void connect_installed_slot(const app_settings_t *settings, int slot, const char *why)
+{
+    install_sta_slot(settings, slot);
+    if (s_stopping_for_sleep || s_state == APP_NET_STA_CONNECTED) return;
+    esp_err_t cerr = esp_wifi_connect();
+    ESP_LOGI(TAG, "%s connect slot=%d err=%s",
+             why ? why : "sta", slot + 1, esp_err_to_name(cerr));
+    if (!s_cred_gave_up && s_state != APP_NET_STA_CONNECTED) {
+        set_state(APP_NET_STA_CONNECTING);
+    }
+}
+
+/**
+ * No saved SSID was in the scan. Do not esp_wifi_connect(): that would burn
+ * a join timeout per invisible network. Cred-apply fails immediately. Other
+ * searches take the SoftAP path after STA_EMPTY_SCAN_MAX empty scans.
+ */
+static void none_visible_path(const char *why)
+{
+    s_need_scan = true;
+    s_try_valid = true;
+    s_try_n = 0;
+    s_slot_reload = false;
+    s_slot_fails = 0;
+    ESP_LOGI(TAG, "no saved SSID in scan (%s)", why ? why : "?");
+    if (s_cred_gave_up) return;
+    if (s_cred_watch) {
+        s_cred_watch = false;
+        s_cred_gave_up = true;
+        set_state(APP_NET_STA_FAILED);
+        if (!(s_softap_portal && wifi_mode_has_ap())) schedule_softap_for_outage();
+        ESP_LOGW(TAG, "saved networks not visible — join failed, SoftAP for reconfig");
+        return;
+    }
+    s_empty_scans++;
+    if (s_empty_scans >= STA_EMPTY_SCAN_MAX) {
+        s_empty_scans = 0;
+        s_retry = 0;
+        if (s_state != APP_NET_STA_FAILED) {
+            set_state(APP_NET_STA_FAILED);
+            ESP_LOGW(TAG, "no visible saved SSID — SoftAP reconfig path");
+        }
+        schedule_softap_for_outage();
+        return;
+    }
+    if (s_state != APP_NET_STA_CONNECTED) set_state(APP_NET_STA_CONNECTING);
+    /* SoftAP keepalive paces the next scan. STA-only schedules a short rescan. */
+    if (!(s_softap_portal && wifi_mode_has_ap())) {
+        schedule_scan_pick(STA_EMPTY_RESCAN_MS);
+    }
+}
+
+/**
+ * Scan, intersect with saved slots, connect the first ordered match.
+ * `from_apply` is the post-save path, which must not abort on s_sta_apply_busy.
+ */
+static void sta_pick_and_connect(const app_wifi_cred_t slots[APP_WIFI_SLOTS],
+                                 const char *why, bool from_apply)
+{
+    if (!slots || s_stopping_for_sleep) return;
+    if (s_state == APP_NET_STA_CONNECTED) return;
+    if (s_pick_busy) return;
+    if (!from_apply && s_sta_apply_busy) return;
+
+    s_pick_busy = true;
+    persist_wifi_pref_if_dirty();
+
+    app_settings_t *settings = calloc(1, sizeof(*settings));
+    if (!settings) {
+        ESP_LOGW(TAG, "pick alloc failed (%s)", why ? why : "?");
+        s_pick_busy = false;
+        return;
+    }
+    memcpy(settings->wifi, slots, sizeof(settings->wifi));
+
+    int scanned = sta_collect_scan();
+    if (!from_apply && (s_sta_apply_busy || s_stopping_for_sleep
+                        || s_state == APP_NET_STA_CONNECTED)) {
+        free(settings);
+        s_pick_busy = false;
+        return;
+    }
+    if (scanned < 0) {
+        free(settings);
+        s_pick_busy = false;
+        return;
+    }
+    if (scanned == 0) {
+        int slot = fallback_slot(slots);
+        if (slot < 0) {
+            free(settings);
+            s_pick_busy = false;
+            none_visible_path(why);
+            return;
+        }
+        s_try_order[0] = slot;
+        s_try_order[1] = -1;
+        s_try_order[2] = -1;
+        s_try_n = 1;
+        s_try_valid = true;
+        s_need_scan = false;
+        s_slot_fails = 0;
+        ESP_LOGW(TAG, "scan failed — try slot %d only (%s)", slot + 1, why ? why : "?");
+        connect_installed_slot(settings, slot, why);
+        free(settings);
+        s_pick_busy = false;
+        return;
+    }
+
+    publish_try_order(slots);
+    if (s_try_n <= 0) {
+        free(settings);
+        s_pick_busy = false;
+        none_visible_path(why);
+        return;
+    }
+
+    s_empty_scans = 0;
+    s_need_scan = false;
+    s_slot_fails = 0;
+    connect_installed_slot(settings, s_try_order[0], why);
+    free(settings);
+    s_pick_busy = false;
+}
+
+static void scan_pick_task(void *arg)
+{
+    (void)arg;
+    int delay = s_scan_delay_ms;
+    if (delay > 0) vTaskDelay(pdMS_TO_TICKS(delay));
+    if (!s_stopping_for_sleep && !s_sta_apply_busy && s_state != APP_NET_STA_CONNECTED) {
+        app_wifi_cred_t slots[APP_WIFI_SLOTS];
+        if (load_wifi_slots(slots)) sta_pick_and_connect(slots, "scan", false);
+    }
+    s_scan_task_busy = false;
+    if (s_pending_rescan_ms >= 0 && !s_stopping_for_sleep && !s_sta_apply_busy
+        && s_state != APP_NET_STA_CONNECTED) {
+        int next = s_pending_rescan_ms;
+        s_pending_rescan_ms = -1;
+        schedule_scan_pick(next);
+    }
+    vTaskDelete(NULL);
+}
+
+static void schedule_scan_pick(int delay_ms)
+{
+    if (delay_ms < 0) delay_ms = 0;
+    if (s_stopping_for_sleep) return;
+    if (s_scan_task_busy) {
+        if (s_pending_rescan_ms < 0 || delay_ms < s_pending_rescan_ms) {
+            s_pending_rescan_ms = delay_ms;
+        }
+        return;
+    }
+    s_scan_delay_ms = delay_ms;
+    s_pending_rescan_ms = -1;
+    s_scan_task_busy = true;
+    if (xTaskCreate(scan_pick_task, "sta_scan", 4096, NULL, 5, NULL) != pdPASS) {
+        s_scan_task_busy = false;
+        ESP_LOGW(TAG, "scan task failed");
+        if (s_try_valid && s_try_n > 0 && !s_need_scan) {
+            esp_wifi_connect();
+        } else if (!(s_softap_portal && wifi_mode_has_ap())) {
+            schedule_softap_for_outage();
+        }
+    }
+}
+
+/**
+ * Count a join failure against the active visible slot.
+ * Stays on that slot until CRED_JOIN_FAIL_MAX (a short flap retries it).
+ * An absent-AP reason, or a used-up budget, moves to the next slot that was
+ * in the same scan. When that list is done, the next attempt scans again
+ * instead of joining saved SSIDs the scan did not see.
  * Does not call Wi-Fi APIs — safe on the event task.
  */
 static void note_slot_join_fail(const app_wifi_cred_t slots[APP_WIFI_SLOTS], uint8_t reason)
@@ -1207,41 +1529,58 @@ static void note_slot_join_fail(const app_wifi_cred_t slots[APP_WIFI_SLOTS], uin
     int idx = active_slot_index(slots);
     if (idx < 0) return;
     s_active_slot = idx;
-    int next = idx;
-    app_wifi_fail_action_t act = app_wifi_on_fail(
-        slots, idx, s_slot_fails + 1, CRED_JOIN_FAIL_MAX, &next);
-    if (act == APP_WIFI_FAIL_KEEP) {
+
+    if (!s_try_valid || s_need_scan) {
+        s_need_scan = true;
+        s_slot_reload = true;
+        ESP_LOGI(TAG, "STA join fail before a fresh scan slot=%d reason=%u",
+                 idx + 1, reason);
+        return;
+    }
+
+    if (!reason_ap_absent(reason) && (s_slot_fails + 1) < CRED_JOIN_FAIL_MAX) {
         s_slot_fails++;
         ESP_LOGI(TAG, "STA join fail slot %d %d/%d reason=%u",
                  idx + 1, s_slot_fails, CRED_JOIN_FAIL_MAX, reason);
         return;
     }
+
+    int next = app_wifi_order_after(s_try_order, s_try_n, idx);
     s_slot_fails = 0;
-    s_active_slot = next;
+    if (next >= 0) {
+        s_active_slot = next;
+        s_slot_reload = true;
+        s_need_scan = false;
+        ESP_LOGI(TAG, "STA join slot %d -> visible slot %d reason=%u",
+                 idx + 1, next + 1, reason);
+        return;
+    }
+
+    s_need_scan = true;
+    s_try_valid = false;
     s_slot_reload = true;
-    ESP_LOGI(TAG, "STA join slot %d exhausted -> slot %d (%s) reason=%u",
-             idx + 1, (next >= 0 ? next + 1 : 0),
-             act == APP_WIFI_FAIL_EXHAUSTED ? "all tried" : "next", reason);
-    if (act == APP_WIFI_FAIL_EXHAUSTED && s_cred_watch) {
+    ESP_LOGI(TAG, "STA visible list exhausted from slot %d reason=%u", idx + 1, reason);
+    if (s_cred_watch) {
         s_cred_watch = false;
         s_cred_gave_up = true;
     }
 }
 
-/** set_config off the Wi-Fi event task, then connect the slot note_slot picked. */
+/** set_config off the Wi-Fi event task, then connect the visible slot note_slot picked. */
 static volatile bool s_slot_task_busy;
 
 static void slot_switch_task(void *arg)
 {
     (void)arg;
     vTaskDelay(pdMS_TO_TICKS(50));
-    if (!s_stopping_for_sleep && !s_sta_apply_busy && s_slot_reload
-        && s_state != APP_NET_STA_CONNECTED) {
+    if (!s_stopping_for_sleep && !s_sta_apply_busy && !s_pick_busy && !s_need_scan
+        && s_slot_reload && s_state != APP_NET_STA_CONNECTED) {
         app_settings_t s;
         memset(&s, 0, sizeof(s));
         (void)app_store_load_settings(&s);
         install_sta_slot(&s, active_slot_index(s.wifi));
-        if (!s_sta_apply_busy && !s_stopping_for_sleep && s_state != APP_NET_STA_CONNECTED) {
+        if (!s_sta_apply_busy && !s_stopping_for_sleep && !s_need_scan
+            && s_state != APP_NET_STA_CONNECTED) {
             esp_err_t cerr = esp_wifi_connect();
             ESP_LOGI(TAG, "slot switch connect slot=%d err=%s",
                      s_active_slot + 1, esp_err_to_name(cerr));
@@ -1258,9 +1597,17 @@ static void schedule_slot_switch(void)
     s_slot_task_busy = true;
     if (xTaskCreate(slot_switch_task, "sta_slot", 4096, NULL, 5, NULL) != pdPASS) {
         s_slot_task_busy = false;
-        /* Do not skip connect() — a missing call stops STA scan until wake. */
-        esp_wifi_connect();
-        ESP_LOGW(TAG, "slot switch task failed — connect kept current profile");
+        /*
+         * A missing later attempt stops STA recovery until wake. Connect only
+         * when the current profile is a slot the scan actually saw.
+         */
+        if (s_try_valid && s_try_n > 0 && !s_need_scan) {
+            esp_wifi_connect();
+            ESP_LOGW(TAG, "slot switch task failed — connect kept scanned profile");
+        } else {
+            schedule_scan_pick(0);
+            ESP_LOGW(TAG, "slot switch task failed — rescan scheduled");
+        }
     }
 }
 
@@ -1312,8 +1659,12 @@ static void apply_saved_sta(bool rebind_httpd)
     s_cred_watch = false;
     s_cred_gave_up = false;
     s_slot_fails = 0;
-    s_active_slot = first;
+    s_active_slot = -1;
     s_slot_reload = true;
+    s_need_scan = true;
+    s_try_valid = false;
+    s_empty_scans = 0;
+    s_pending_rescan_ms = -1;
 
     stop_sta_softap_keepalive();
     for (int i = 0; i < 40 && s_sta_ka_task != NULL; i++) {
@@ -1321,6 +1672,10 @@ static void apply_saved_sta(bool rebind_httpd)
     }
     if (s_sta_ka_task) {
         ESP_LOGW(TAG, "STA keepalive still running during credential apply");
+    }
+    /* Let an in-flight scan finish and skip its connect before we retune. */
+    for (int i = 0; i < 80 && (s_pick_busy || s_scan_task_busy); i++) {
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 
     (void)esp_wifi_disconnect();
@@ -1335,13 +1690,8 @@ static void apply_saved_sta(bool rebind_httpd)
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "apply STA set AP: %s", esp_err_to_name(err));
     }
+    /* Placeholder profile until the scan below chooses a visible slot. */
     install_sta_slot(&settings, first);
-    if (s_slot_reload) {
-        ESP_LOGW(TAG, "apply STA profile still old — disconnect and set_config again");
-        (void)esp_wifi_disconnect();
-        vTaskDelay(pdMS_TO_TICKS(300));
-        install_sta_slot(&settings, first);
-    }
 
     err = esp_wifi_start();
     if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) {
@@ -1370,13 +1720,17 @@ static void apply_saved_sta(bool rebind_httpd)
     }
     set_state(APP_NET_STA_CONNECTING);
 
+    /*
+     * Same scan order as wake: last success first if it is visible, otherwise
+     * the other in-range saved names. Absent names are not joined, so a new
+     * network saved after leaving the old one connects without those timeouts.
+     */
     s_cred_watch = true;
     s_slot_fails = 0;
-    s_active_slot = first;
-    esp_err_t cerr = esp_wifi_connect();
-    ESP_LOGI(TAG, "apply STA connect slot=%d ssid_len=%u err=%s softap=%d",
-             first + 1, (unsigned)strlen(settings.wifi[first].ssid),
-             esp_err_to_name(cerr), (int)wifi_mode_has_ap());
+    vTaskDelay(pdMS_TO_TICKS(100));
+    sta_pick_and_connect(settings.wifi, "apply", true);
+    ESP_LOGI(TAG, "apply STA scan slot=%d softap=%d",
+             s_active_slot + 1, (int)wifi_mode_has_ap());
 
     s_sta_apply_busy = false;
     if (s_sta_ka_task == NULL) {
@@ -1387,8 +1741,9 @@ static void apply_saved_sta(bool rebind_httpd)
 }
 
 /**
- * While SoftAP is up for reconfig, keep STA searching the saved home SSID.
- * Runs off the wifi event task; paces connect() so SoftAP beacons stay up.
+ * While SoftAP is up for reconfig, keep STA searching saved networks that are
+ * actually visible. A fresh scan runs when the candidate list is stale.
+ * Runs off the wifi event task; paces attempts so SoftAP beacons stay up.
  */
 static void sta_softap_keepalive_task(void *arg)
 {
@@ -1422,7 +1777,11 @@ static void sta_softap_keepalive_task(void *arg)
         }
 
         if (s_state != APP_NET_STA_CONNECTED && !s_stopping_for_sleep && !s_tls_busy
-            && !s_sta_apply_busy) {
+            && !s_sta_apply_busy && !s_pick_busy) {
+            if (s_need_scan || !s_try_valid) {
+                /* Just scanned (boot / previous pass): wait out the pace interval. */
+                if (!scan_recent()) sta_pick_and_connect(s.wifi, "keepalive", false);
+            } else {
             wifi_mode_t m = WIFI_MODE_NULL;
             const bool ap_only = esp_wifi_get_mode(&m) == ESP_OK && m == WIFI_MODE_AP;
             /*
@@ -1457,6 +1816,7 @@ static void sta_softap_keepalive_task(void *arg)
             if (!s_cred_gave_up && s_state != APP_NET_STA_CONNECTED) {
                 set_state(APP_NET_STA_CONNECTING);
             }
+            }
         }
 
         for (int i = 0; i < (STA_SOFTAP_RECONNECT_MS / 250) && s_sta_ka_wanted; i++) {
@@ -1482,7 +1842,7 @@ static void ensure_sta_softap_keepalive(void)
 
     s_sta_ka_wanted = true;
     if (s_sta_ka_task) return;
-    if (xTaskCreate(sta_softap_keepalive_task, "sta_ka", 4096, NULL, 5, &s_sta_ka_task) != pdPASS) {
+    if (xTaskCreate(sta_softap_keepalive_task, "sta_ka", 6144, NULL, 5, &s_sta_ka_task) != pdPASS) {
         s_sta_ka_task = NULL;
         s_sta_ka_wanted = false;
         ESP_LOGW(TAG, "STA SoftAP keepalive task create failed");
@@ -1567,6 +1927,7 @@ static void got_ip_followup_task(void *arg)
 {
     (void)arg;
     vTaskDelay(pdMS_TO_TICKS(50));
+    persist_wifi_pref_if_dirty();
     if (s_stopping_for_sleep) {
         vTaskDelete(NULL);
         return;
@@ -1616,9 +1977,10 @@ static void on_wifi(void *arg, esp_event_base_t base, int32_t id, void *data)
             return;
         }
         /* apply_saved_sta() owns this disconnect; do not reconnect the old SSID. */
-        if (s_sta_apply_busy) {
+        if (s_sta_apply_busy || s_pick_busy) {
             s_ip[0] = '\0';
-            ESP_LOGI(TAG, "STA disconnect during credential apply (reason=%u)", reason);
+            ESP_LOGI(TAG, "STA disconnect during %s (reason=%u)",
+                     s_sta_apply_busy ? "credential apply" : "scan pick", reason);
             return;
         }
 
@@ -1639,9 +2001,9 @@ static void on_wifi(void *arg, esp_event_base_t base, int32_t id, void *data)
             ESP_LOGW(TAG, "STA lost during TLS — SoftAP after restore_httpd");
         }
 
-        /* Same per-slot budget for a fresh save and for later outage search.
-         * The failure popup latches only when a credential apply has walked
-         * every filled slot. Outage search keeps rotating without that popup. */
+        /* Budget counts only the slot we are actually joining. Invisible saved
+         * SSIDs are not tried. The failure popup latches when a credential
+         * apply has exhausted the visible list (or the scan showed none). */
         note_slot_join_fail(disc_slots, reason);
 
         /*
@@ -1675,7 +2037,9 @@ static void on_wifi(void *arg, esp_event_base_t base, int32_t id, void *data)
          */
         if (s_retry < STA_RETRY_MAX && !s_cred_gave_up) {
             s_retry++;
-            if (s_slot_reload) {
+            if (s_need_scan || !s_try_valid) {
+                schedule_scan_pick(0);
+            } else if (s_slot_reload) {
                 schedule_slot_switch();
             } else {
                 esp_wifi_connect();
@@ -1738,6 +2102,13 @@ static void on_ip(void *arg, esp_event_base_t base, int32_t id, void *data)
         s_cred_gave_up = false;
         s_slot_fails = 0;
         s_slot_reload = false;
+        s_empty_scans = 0;
+        s_need_scan = false;
+        if (s_active_slot >= 0 && s_active_slot < APP_WIFI_SLOTS
+            && s_active_slot != s_pref_slot) {
+            s_pref_slot = s_active_slot;
+            s_pref_dirty = s_active_slot;
+        }
         stop_sta_softap_keepalive();
         xEventGroupSetBits(s_wifi_eg, WIFI_CONNECTED_BIT);
         set_state(APP_NET_STA_CONNECTED);
@@ -1781,6 +2152,7 @@ esp_err_t app_net_start(app_net_cb_t cb)
 
     app_settings_t settings;
     app_store_load_settings(&settings);
+    s_pref_slot = app_store_load_wifi_pref();
 
     if (!s_httpd_mu) {
         s_httpd_mu = xSemaphoreCreateMutex();
@@ -1788,9 +2160,12 @@ esp_err_t app_net_start(app_net_cb_t cb)
 
     if (settings_have_wifi(&settings)) {
         const int boot_slot = app_wifi_first_slot(settings.wifi);
-        s_active_slot = boot_slot;
+        s_active_slot = -1;
         s_slot_fails = 0;
-        s_slot_reload = false;
+        s_slot_reload = true;
+        s_need_scan = true;
+        s_try_valid = false;
+        s_empty_scans = 0;
         wifi_config_t sta = { 0 };
         strncpy((char *)sta.sta.ssid, settings.wifi[boot_slot].ssid, sizeof(sta.sta.ssid));
         strncpy((char *)sta.sta.password, settings.wifi[boot_slot].pass, sizeof(sta.sta.password));
@@ -1817,12 +2192,13 @@ esp_err_t app_net_start(app_net_cb_t cb)
         }
         s_httpd_needs_softap_rebind = false;
         set_state(APP_NET_STA_CONNECTING);
-        esp_wifi_connect();
-        /* SoftAP is already up at boot — arm keepalive so a failed first
-         * connect cannot stall STA forever (event-task throttle bug). */
+        /* Scan on this app task, then join the last-success slot if it is visible. */
+        sta_pick_and_connect(settings.wifi, "boot", false);
+        /* SoftAP is already up at boot — arm keepalive so a missed scan
+         * cannot stall STA forever (event-task throttle bug). */
         ensure_sta_softap_keepalive();
-        ESP_LOGI(TAG, "boot APSTA slot=%d ssid_len=%u softap=%s http=%d dns=%d",
-                 boot_slot + 1, (unsigned)strlen(settings.wifi[boot_slot].ssid), s_ap_ssid,
+        ESP_LOGI(TAG, "boot APSTA slot=%d pref=%d softap=%s http=%d dns=%d",
+                 s_active_slot + 1, s_pref_slot + 1, s_ap_ssid,
                  s_httpd != NULL, s_dns != NULL);
     } else {
         ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
@@ -1959,6 +2335,7 @@ void app_net_stop_for_sleep(void)
              (int)(s_httpd != NULL), (int)s_softap_portal);
     /* Must be first: STA_DISCONNECTED must not call ensure_softap / wifi_start. */
     s_stopping_for_sleep = true;
+    persist_wifi_pref_if_dirty();
     s_tls_busy = false;
     s_fetch_pending = false;
     s_softap_for_outage = false;
