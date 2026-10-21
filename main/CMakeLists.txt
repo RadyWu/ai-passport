@@ -4,6 +4,8 @@ idf_component_register(
          "app_store.c"
          "app_net.c"
          "app_deepseek.c"
+         "app_debug_log.c"
+         "app_prompt.c"
          "app_sleep.c"
          "app_ui.c"
          "../assets/fonts/font_toilet_14.c"

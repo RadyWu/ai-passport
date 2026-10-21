@@ -35,6 +35,45 @@ under the original `ssid` / `pass` keys. Wi-Fi 2 and Wi-Fi 3 use `ssid2` /
 `pass2` and `ssid3` / `pass3`. Older firmware that only wrote Wi-Fi 1 still
 loads.
 
+## Debug capture on the config page
+
+The same SoftAP and LAN page (`/`, no login) has two read-only boxes at the
+bottom. Labels are Chinese; the paired Chinese notes quote them. Order is
+**newest first**. Two saved entries are separated by one blank line. An empty
+history shows a short Chinese empty-state word, not sample text.
+
+1. Recent system prompts — the last two `role:system` texts sent to DeepSeek,
+   after preference, avoid-topics, and salt are included. This is the text the
+   model sees, not the JSON envelope.
+2. Recent raw LLM replies — the last two assistant content strings parsed from
+   the API, before the `##title##` marker is removed.
+
+A third value overwrites the oldest slot. Both rings survive reboot in NVS
+namespace `toilet`:
+
+| Key | Type | Max size (including NUL) |
+| --- | --- | --- |
+| `spi` | u8 | prompt ring (`count<<2 \| newest slot`) |
+| `sp0`, `sp1` | string | 2048 bytes |
+| `lri` | u8 | raw-reply ring, same packing |
+| `lr0`, `lr1` | blob | 8192 bytes |
+
+Prompts stay NVS strings because they fit under the single-page string limit
+(~4000 bytes). Raw replies are blobs so they can hold a full parsed article.
+The 64 KiB NVS partition still has room for the article blob and Wi-Fi keys:
+two full raw replies plus the article use about 9 of 16 pages, and an update
+writes the new blob before erasing the old one.
+
+Over-budget text is cut with an ellipsis plus a Chinese "truncated" tag
+instead of failing the fetch. Prompts keep the head (marker at the end). Raw
+replies keep the tail (marker at the start) so the title marker remains. A
+normal prompt is about 1.4 KB and is stored whole. If the parser fills the
+8192-byte article buffer before the closing quote, the stored raw copy ends
+with the marker. If NVS reports it is out of space, the raw value is retried
+at 4096 then 2048 bytes, still keeping the tail. The system prompt is saved
+once the request JSON is built, including when HTTPS fails before a body
+exists. Raw text is saved only after assistant content parses.
+
 ## Chinese glyphs
 
 UI chrome and the local sample article use `assets/fonts/font_toilet_14` (PLAIN 4bpp subset, ~3600 code points: ASCII + common punctuation + Table of General Standard Chinese Characters level-1). Hardcoded source strings are gated by `tests/test_toilet_font_coverage.py`. DeepSeek body text outside level-1 may still show placeholder boxes.

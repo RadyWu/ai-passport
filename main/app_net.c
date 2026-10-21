@@ -1,4 +1,5 @@
 #include "app_net.h"
+#include "app_debug_log.h"
 #include "app_save_policy.h"
 #include "esp_event.h"
 #include "esp_http_server.h"
@@ -246,7 +247,10 @@ static const char *PAGE_HTML_HEAD =
     "h1{font-size:1.3rem}label{display:block;margin-top:12px;font-size:.9rem;opacity:.85}"
     "input,textarea{width:100%;box-sizing:border-box;padding:10px;border-radius:8px;border:1px solid #445;background:#0f1622;color:#e8eef7}"
     "button{margin-top:18px;width:100%;padding:12px;border:0;border-radius:8px;background:#3d9cf0;color:#fff;font-size:1rem}"
-    "p.hint{opacity:.7;font-size:.85rem}</style></head><body>"
+    "p.hint{opacity:.7;font-size:.85rem}"
+    "h2{font-size:1rem;margin:22px 0 0}"
+    "textarea.dbg{white-space:pre-wrap;min-height:9rem;max-height:18rem;overflow:auto}"
+    "</style></head><body>"
     "<h1>AI护照 · 解闷阅读</h1>"
     "<p class=hint>最多填写 3 个 2.4GHz Wi-Fi，按 Wi-Fi 1、2、3 的顺序尝试，连上一个就停止；空着的名称会跳过。"
     "首次请填该 Wi-Fi 密码；已保存过可留空保留原密码。无密码网络请在密码框填一个空格。"
@@ -267,8 +271,92 @@ static const char *PAGE_HTML_TAIL =
     "if(c)c.value='1';"
     "b.disabled=true;b.textContent='正在保存…';"
     "if(s)s.textContent='已提交，请稍候；成功后本页会显示「已保存」。';"
-    "});</script>"
-    "</body></html>";
+    "});</script>";
+
+static const char *PAGE_HTML_END = "</body></html>";
+
+/** Escape a slice into small chunks so a long debug blob does not need a 6x buffer. */
+static esp_err_t chunk_html_escape_n(httpd_req_t *req, const char *s, size_t n)
+{
+    char tmp[160];
+    size_t j = 0;
+    if (!s || n == 0) return ESP_OK;
+    for (size_t i = 0; i < n; i++) {
+        const char *rep;
+        size_t rlen;
+        char one;
+        switch (s[i]) {
+        case '&': rep = "&amp;"; rlen = 5; break;
+        case '"': rep = "&quot;"; rlen = 6; break;
+        case '<': rep = "&lt;"; rlen = 4; break;
+        case '>': rep = "&gt;"; rlen = 4; break;
+        default:
+            one = s[i];
+            rep = &one;
+            rlen = 1;
+            break;
+        }
+        if (j + rlen >= sizeof(tmp)) {
+            tmp[j] = '\0';
+            if (httpd_resp_sendstr_chunk(req, tmp) != ESP_OK) return ESP_FAIL;
+            j = 0;
+        }
+        memcpy(tmp + j, rep, rlen);
+        j += rlen;
+    }
+    if (!j) return ESP_OK;
+    tmp[j] = '\0';
+    return httpd_resp_sendstr_chunk(req, tmp);
+}
+
+typedef struct {
+    httpd_req_t *req;
+    esp_err_t err;
+} dbg_emit_t;
+
+static void dbg_emit_html(void *ctx, const char *bytes, size_t len)
+{
+    dbg_emit_t *c = (dbg_emit_t *)ctx;
+    if (!c || c->err != ESP_OK) return;
+    c->err = chunk_html_escape_n(c->req, bytes, len);
+}
+
+/**
+ * Read-only box. Newest entry, a blank line, then the older entry.
+ * One malloc pair at a time; freed before the next box.
+ */
+static void send_debug_box(httpd_req_t *req, const char *title, const char *hint,
+                           size_t slot_sz,
+                           esp_err_t (*load)(int position, char *buf, size_t buf_sz))
+{
+    char *newest = NULL;
+    char *older = NULL;
+
+    httpd_resp_sendstr_chunk(req, "<h2>");
+    httpd_resp_sendstr_chunk(req, title);
+    httpd_resp_sendstr_chunk(req, "</h2><p class=hint>");
+    httpd_resp_sendstr_chunk(req, hint);
+    httpd_resp_sendstr_chunk(req, "</p><textarea class=dbg readonly rows=12 wrap=soft>");
+
+    if (slot_sz > 0) {
+        newest = malloc(slot_sz);
+        older = malloc(slot_sz);
+    }
+    if (!newest || !older) {
+        static const char empty[] = "暂无";
+        (void)chunk_html_escape_n(req, empty, sizeof(empty) - 1);
+    } else {
+        dbg_emit_t ctx = { .req = req, .err = ESP_OK };
+        newest[0] = '\0';
+        older[0] = '\0';
+        (void)load(0, newest, slot_sz);
+        (void)load(1, older, slot_sz);
+        app_debug_emit_pair(newest, older, dbg_emit_html, &ctx);
+    }
+    free(newest);
+    free(older);
+    httpd_resp_sendstr_chunk(req, "</textarea>");
+}
 
 /** Worst-case escaped length for preference (largest field). */
 #define HTML_ESC_BUF (APP_STORE_PROMPT_MAX * 6 + 1)
@@ -356,8 +444,17 @@ static esp_err_t root_get(httpd_req_t *req)
     httpd_resp_sendstr_chunk(req, "</textarea>");
 
     httpd_resp_sendstr_chunk(req, PAGE_HTML_TAIL);
-    httpd_resp_sendstr_chunk(req, NULL);
     free(esc);
+    esc = NULL;
+    /* Outside the form. Newest first; a blank line separates the two saved entries. */
+    send_debug_box(req, "调试：最近系统提示词",
+                   "新的在前，两条之间空一行。已包含偏好、避开话题和种子。",
+                   APP_DEBUG_PROMPT_MAX, app_store_load_debug_prompt);
+    send_debug_box(req, "调试：最近 LLM 原文",
+                   "新的在前，两条之间空一行。助手原文，去掉题目标记之前。",
+                   APP_DEBUG_RAW_MAX, app_store_load_debug_raw);
+    httpd_resp_sendstr_chunk(req, PAGE_HTML_END);
+    httpd_resp_sendstr_chunk(req, NULL);
     /* Do not log ssid/pass/apikey/pref contents. */
     ESP_LOGI(TAG, "config page served (prefill=%d)",
              (int)(s.has_wifi || s.has_api_key || s.preference[0] != '\0'));

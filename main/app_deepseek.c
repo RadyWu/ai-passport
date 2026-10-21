@@ -1,6 +1,8 @@
 #include "app_deepseek.h"
 #include "app_article.h"
 #include "app_cooldown.h"
+#include "app_debug_log.h"
+#include "app_prompt.h"
 #include "app_store.h"
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
@@ -15,6 +17,11 @@
 #include <string.h>
 
 static const char *TAG = "app_deepseek";
+
+_Static_assert(APP_PROMPT_TOPIC_SLOTS == APP_STORE_TOPIC_SLOTS, "topic slot count");
+_Static_assert(APP_PROMPT_TOPIC_MAX == APP_STORE_TOPIC_MAX, "topic length");
+_Static_assert(APP_PROMPT_SYS_MAX == APP_DEBUG_PROMPT_MAX, "prompt store matches builder");
+_Static_assert(APP_DEBUG_RAW_MAX == APP_ARTICLE_MAX_BYTES, "raw store matches article cap");
 
 #define DS_REQ_BUF  3072
 /** JSON envelope + ~2000 Chinese chars; keep under SoftAP-free heap peak. */
@@ -74,27 +81,59 @@ static esp_err_t http_event(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
-static void json_escape(const char *in, char *out, size_t out_sz)
+/** Returns false when out is too small to hold the whole escaped string. */
+static bool json_escape(const char *in, char *out, size_t out_sz)
 {
     size_t o = 0;
-    for (size_t i = 0; in && in[i] && o + 2 < out_sz; i++) {
-        char c = in[i];
+    size_t i = 0;
+    if (!out || out_sz == 0) return false;
+    out[0] = '\0';
+    if (!in) return true;
+    for (; in[i] && o + 2 < out_sz; i++) {
+        unsigned char c = (unsigned char)in[i];
         if (c == '"' || c == '\\') {
             if (o + 3 >= out_sz) break;
             out[o++] = '\\';
-            out[o++] = c;
-        } else if ((unsigned char)c < 0x20) {
+            out[o++] = (char)c;
+        } else if (c < 0x20) {
             continue;
         } else {
-            out[o++] = c;
+            out[o++] = (char)c;
         }
     }
     out[o] = '\0';
+    return in[i] == '\0';
 }
 
-/** Prefer choices[].message.content over any earlier "content" key. */
-static bool extract_content(const char *json, char *out, size_t out_sz)
+static int build_chat_request(char *body, size_t body_sz, const char *system_text)
 {
+    static const char prefix[] =
+        "{\"model\":\"deepseek-chat\",\"messages\":["
+        "{\"role\":\"system\",\"content\":\"";
+    static const char suffix[] =
+        "\"},{\"role\":\"user\",\"content\":\"请直接写正文，最后一行用##题目##标注主题。\"}"
+        "],\"temperature\":1.0,\"max_tokens\":2400}";
+    size_t plen = sizeof(prefix) - 1;
+    size_t slen = sizeof(suffix) - 1;
+    size_t esc_cap;
+    size_t elen;
+
+    if (!body || body_sz < plen + slen + 2) return -1;
+    memcpy(body, prefix, plen);
+    esc_cap = body_sz - plen - slen;
+    if (!json_escape(system_text ? system_text : "", body + plen, esc_cap)) return -1;
+    elen = strlen(body + plen);
+    memcpy(body + plen + elen, suffix, slen + 1);
+    return (int)(plen + elen + slen);
+}
+
+/** Prefer choices[].message.content over any earlier "content" key.
+ *  *truncated is set when the decoded content did not end on the closing quote
+ *  (parse buffer full, or the JSON string was cut off).
+ */
+static bool extract_content(const char *json, char *out, size_t out_sz, bool *truncated)
+{
+    if (truncated) *truncated = false;
     const char *p = strstr(json, "\"message\"");
     if (p) {
         const char *c = strstr(p, "\"content\"");
@@ -138,6 +177,7 @@ static bool extract_content(const char *json, char *out, size_t out_sz)
         out[o++] = *p++;
     }
     out[o] = '\0';
+    if (truncated && *p != '"') *truncated = true;
     return o > 0;
 }
 
@@ -236,56 +276,39 @@ esp_err_t app_deepseek_fetch(const app_settings_t *settings, char **out_heap)
 
     log_heap("fetch start");
 
-    /* Phase A: build request JSON, then free helpers before TLS. */
-    char *pref_esc = calloc(1, APP_STORE_PROMPT_MAX * 2);
-    char *avoid = calloc(1, APP_STORE_TOPIC_SLOTS * APP_STORE_TOPIC_MAX + 64);
+    /* Phase A: build the system text the model sees, then the JSON envelope. */
+    char *sys = malloc(APP_PROMPT_SYS_MAX);
     char *body = malloc(DS_REQ_BUF);
-    if (!pref_esc || !avoid || !body) {
+    if (!sys || !body) {
         set_detail("req OOM free=%u largest=%u",
                    (unsigned)esp_get_free_heap_size(),
                    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
-        free(pref_esc); free(avoid); free(body);
+        free(sys); free(body);
         return ESP_ERR_NO_MEM;
     }
-    json_escape(settings->preference, pref_esc, APP_STORE_PROMPT_MAX * 2);
 
     char topics[APP_STORE_TOPIC_SLOTS][APP_STORE_TOPIC_MAX];
     app_store_load_topics(topics);
-    size_t ao = 0;
-    for (int i = 0; i < APP_STORE_TOPIC_SLOTS; i++) {
-        if (!topics[i][0]) continue;
-        char esc[APP_STORE_TOPIC_MAX * 2];
-        json_escape(topics[i], esc, sizeof(esc));
-        int n = snprintf(avoid + ao, APP_STORE_TOPIC_SLOTS * APP_STORE_TOPIC_MAX + 64 - ao,
-                         "%s%s", ao ? "；" : "", esc);
-        if (n > 0) ao += (size_t)n;
-    }
-
     uint32_t salt = (uint32_t)(esp_timer_get_time() / 1000);
-    const char *pref = pref_esc[0] ? pref_esc : "轻松有趣的冷知识或生活小故事";
-    int blen = snprintf(body, DS_REQ_BUF,
-             "{\"model\":\"deepseek-chat\",\"messages\":["
-             "{\"role\":\"system\",\"content\":"
-             "\"你是中文短文写手。写一篇约%d到%d字中文短文，适合蹲厕约3到4分钟。"
-             "禁止AI套话开场。先输出正文，正文结束后另起一行，"
-             "用##题目##格式写出本篇简短中文主题（两个井号之间只有题目，不要书名号或其他符号）。"
-             "读者不应把##行当成正文的一部分。"
-             "这次的文章要跟已写过的话题完全无关；在用户偏好领域内大胆换题材、角度与例子，"
-             "避免同质化或小幅改写。偏好：%s。%s%s种子%u。\"},"
-             "{\"role\":\"user\",\"content\":\"请直接写正文，最后一行用##题目##标注主题。\"}"
-             "],\"temperature\":1.0,\"max_tokens\":2400}",
-             APP_ARTICLE_TARGET_MIN, APP_ARTICLE_TARGET_MAX,
-             pref,
-             avoid[0] ? "以下话题已写过，勿重复：" : "",
-             avoid[0] ? avoid : "",
-             (unsigned)salt);
-    free(pref_esc);
-    free(avoid);
-    pref_esc = avoid = NULL;
-    if (blen < 0 || blen >= DS_REQ_BUF) {
-        free(body);
+    if (app_prompt_build_system(sys, APP_PROMPT_SYS_MAX, settings->preference,
+                                topics, salt) < 0) {
+        free(sys); free(body);
         return ESP_ERR_INVALID_SIZE;
     }
+    int blen = build_chat_request(body, DS_REQ_BUF, sys);
+    if (blen < 0 || blen >= DS_REQ_BUF) {
+        free(sys); free(body);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    /* Persist the prompt that is about to be sent, even if HTTPS never returns a body. */
+    {
+        esp_err_t perr = app_store_push_debug_prompt(sys);
+        if (perr != ESP_OK) {
+            ESP_LOGW(TAG, "debug prompt not stored: %s", esp_err_to_name(perr));
+        }
+    }
+    free(sys);
+    sys = NULL;
     ESP_LOGI(TAG, "request JSON %d bytes", blen);
     log_heap("after req build");
 
@@ -364,13 +387,36 @@ esp_err_t app_deepseek_fetch(const app_settings_t *settings, char **out_heap)
         return ESP_ERR_NO_MEM;
     }
     out[0] = '\0';
-    if (!extract_content(resp, out, APP_ARTICLE_MAX_BYTES)) {
+    bool content_cut = false;
+    if (!extract_content(resp, out, APP_ARTICLE_MAX_BYTES, &content_cut)) {
         ESP_LOGE(TAG, "parse fail head=%.120s", resp);
         free(resp);
         free(out);
         return ESP_ERR_NOT_FOUND;
     }
     free(resp);
+    /* Copy before the caller strips ##题目##. Marker only when the parse buffer cut the body. */
+    {
+        esp_err_t rerr;
+        if (content_cut) {
+            char *marked = malloc(APP_DEBUG_RAW_MAX);
+            if (!marked) {
+                ESP_LOGW(TAG, "debug raw copy OOM");
+            } else {
+                app_debug_capture(marked, APP_DEBUG_RAW_MAX, out, false, true);
+                rerr = app_store_push_debug_raw(marked);
+                free(marked);
+                if (rerr != ESP_OK) {
+                    ESP_LOGW(TAG, "debug raw not stored: %s", esp_err_to_name(rerr));
+                }
+            }
+        } else {
+            rerr = app_store_push_debug_raw(out);
+            if (rerr != ESP_OK) {
+                ESP_LOGW(TAG, "debug raw not stored: %s", esp_err_to_name(rerr));
+            }
+        }
+    }
     *out_heap = out;
     ESP_LOGI(TAG, "ok codepoints~%u",
              (unsigned)app_utf8_codepoints(out, strnlen(out, APP_ARTICLE_MAX_BYTES)));
